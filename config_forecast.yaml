@@ -39,3 +39,11 @@ forecast:
   # out-of-sample realized model performance with current validation weights.
   realized_weight_blend: 0.65
   realized_weight_min_samples: 30
+
+# Institutional alpha layer.
+# This is intentionally separated from the next-close price model until enough
+# out-of-sample alpha history exists. It provides independent confirmation,
+# crowding/risk context and its own long-term factor leaderboard.
+institutional_alpha:
+  use_gate_derivatives: true
+  derivatives_history_points: 96
