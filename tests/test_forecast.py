@@ -31,6 +31,15 @@ def test_forecast_features_are_causal_and_target_last_row_is_unknown():
     assert pd.isna(frame.iloc[-1]["target_return"])
 
 
+def test_forecast_uses_latest_closed_candle_close_as_base_price():
+    market = synthetic_market()
+    cfg = ForecastConfig(min_train_rows=500, train_window=1200)
+    result = forecast_next_candle(market, "15m", cfg)
+
+    assert result.current_price == market.iloc[-1]["close"]
+    assert pd.Timestamp(result.as_of) == market.index[-1]
+
+
 def test_forecast_returns_probabilistic_metadata():
     cfg = ForecastConfig(min_train_rows=500, train_window=1200)
     result = forecast_next_candle(synthetic_market(), "15m", cfg)
