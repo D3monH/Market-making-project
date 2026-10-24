@@ -15,19 +15,45 @@ EXCHANGE_ALIASES = {
     "gateio": "gate",
 }
 
+# Some venues reject OHLCV requests whose `since` timestamp is farther back
+# than a fixed number of candles. Gate currently rejects requests older than
+# roughly 10,000 interval points. Keep a safety margin so clock/boundary
+# differences cannot turn an otherwise valid request into INVALID_PARAM_VALUE.
+EXCHANGE_OHLCV_MAX_LOOKBACK_POINTS = {
+    "gate": 10_000,
+}
+OHLCV_LOOKBACK_SAFETY_POINTS = 100
+
 
 def normalize_exchange_id(exchange_id: str) -> str:
     value = str(exchange_id).strip().lower()
     return EXCHANGE_ALIASES.get(value, value)
 
 
-def _initial_since_ms(now_ms: int, timeframe_ms: int, bars: int) -> int:
-    """Start slightly before the requested window so gaps can be tolerated.
+def ohlcv_history_point_limit(exchange_id: str) -> int | None:
+    """Return the venue's known maximum OHLCV lookback in interval points."""
+    return EXCHANGE_OHLCV_MAX_LOOKBACK_POINTS.get(normalize_exchange_id(exchange_id))
 
-    The caller must still paginate all the way to `now_ms`; the buffer is not a
-    reason to stop once `bars` rows have been collected.
+
+def _initial_since_ms(
+    now_ms: int,
+    timeframe_ms: int,
+    bars: int,
+    max_lookback_points: int | None = None,
+) -> int:
+    """Choose a recent-enough starting timestamp for paginated OHLCV download.
+
+    Normally we start about 10% before the requested window to tolerate gaps.
+    When a venue has a hard history boundary, the buffered request is clamped
+    inside that boundary. This is especially important for Gate, where asking
+    for 5,000 Beijing-day candles requires ~30,000 4h source candles, while the
+    venue only accepts requests within the latest ~10,000 interval points.
     """
-    return now_ms - int(bars * timeframe_ms * 1.10)
+    requested_points = max(1, int(float(bars) * 1.10))
+    if max_lookback_points is not None:
+        safe_points = max(1, int(max_lookback_points) - OHLCV_LOOKBACK_SAFETY_POINTS)
+        requested_points = min(requested_points, safe_points)
+    return now_ms - int(requested_points * timeframe_ms)
 
 
 def _create_exchange(exchange_id: str):
@@ -282,6 +308,10 @@ def fetch_ohlcv(exchange_id: str, symbol: str, timeframe: str, bars: int) -> pd.
     This low-level function preserves the venue's native candle boundaries. Use
     `fetch_forecast_ohlcv` for forecasting, because forecast 1d candles have an
     explicit natural-day timezone policy.
+
+    If a venue exposes a hard history boundary, requests larger than that
+    boundary degrade gracefully to the maximum recent window instead of asking
+    for an invalid ancient `since` timestamp.
     """
     if bars <= 0:
         raise ValueError("bars must be greater than zero")
@@ -292,11 +322,24 @@ def fetch_ohlcv(exchange_id: str, symbol: str, timeframe: str, bars: int) -> pd.
 
     timeframe_ms = int(exchange.parse_timeframe(timeframe) * 1000)
     now_ms = int(exchange.milliseconds())
-    since = _initial_since_ms(now_ms, timeframe_ms, bars)
+    history_limit = ohlcv_history_point_limit(resolved_exchange_id)
+    since = _initial_since_ms(
+        now_ms,
+        timeframe_ms,
+        bars,
+        max_lookback_points=history_limit,
+    )
     rows: list[list] = []
 
-    request_limit = min(1000, max(1, bars))
-    max_calls = max(20, min(500, bars // 25 + 30))
+    effective_target_bars = int(bars)
+    if history_limit is not None:
+        effective_target_bars = min(
+            effective_target_bars,
+            max(1, int(history_limit) - OHLCV_LOOKBACK_SAFETY_POINTS),
+        )
+
+    request_limit = min(1000, max(1, effective_target_bars))
+    max_calls = max(20, min(500, effective_target_bars // 25 + 30))
     calls = 0
 
     while since < now_ms and calls < max_calls:
@@ -332,7 +375,14 @@ def fetch_ohlcv(exchange_id: str, symbol: str, timeframe: str, bars: int) -> pd.
     df = df[df["timestamp"] + timeframe_ms <= final_now_ms]
     df = df.tail(bars)
     df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
-    return df.set_index("timestamp")
+    result = df.set_index("timestamp")
+    result.attrs["requested_bars"] = int(bars)
+    result.attrs["returned_bars"] = int(len(result))
+    result.attrs["venue_history_limit_points"] = history_limit
+    result.attrs["history_limited"] = bool(
+        history_limit is not None and int(bars) > int(len(result))
+    )
+    return result
 
 
 def fetch_forecast_ohlcv(
@@ -348,6 +398,12 @@ def fetch_forecast_ohlcv(
     is rebuilt from closed 4h candles so that the day is the natural day in
     `daily_timezone` (Asia/Shanghai by default) rather than the exchange's UTC
     day. The final dataset is rejected if its latest closed candle is stale.
+
+    For venues with a finite OHLCV history window, a very large requested 1d
+    count is treated as a preferred target, not a reason to fail. We aggregate
+    as many complete recent natural-day candles as the venue can actually
+    supply, while still enforcing the model's minimum training-row requirement
+    at the forecast-engine layer.
     """
     normalized_tf = timeframe.strip().lower()
     if normalized_tf != "1d":
@@ -374,6 +430,15 @@ def fetch_forecast_ohlcv(
             f"No complete {daily_timezone} daily candles could be built for {symbol}"
         )
     ensure_recent_closed_data(daily, "1d")
+    daily.attrs["requested_bars"] = int(bars)
+    daily.attrs["returned_bars"] = int(len(daily))
+    daily.attrs["source_timeframe"] = FORECAST_DAILY_BASE_TIMEFRAME
+    daily.attrs["source_requested_bars"] = int(raw_bars)
+    daily.attrs["source_returned_bars"] = int(len(base))
+    daily.attrs["venue_history_limit_points"] = base.attrs.get(
+        "venue_history_limit_points"
+    )
+    daily.attrs["history_limited"] = bool(len(daily) < int(bars))
     return daily
 
 
