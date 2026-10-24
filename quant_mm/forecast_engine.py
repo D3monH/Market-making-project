@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 from typing import Any
 
 import numpy as np
@@ -10,24 +10,12 @@ from sklearn.linear_model import LinearRegression, LogisticRegression, Ridge
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
-
 FORECAST_FEATURES = [
-    "ret_1",
-    "ret_2",
-    "ret_4",
-    "ret_8",
-    "ret_16",
-    "ret_32",
-    "vol_4",
-    "vol_16",
-    "vol_48",
-    "volume_z_20",
-    "volume_z_96",
-    "range_pct",
-    "body_pct",
-    "ema_fast_distance",
-    "ema_slow_distance",
-    "rsi_14",
+    "ret_1", "ret_2", "ret_4", "ret_8", "ret_16", "ret_32",
+    "vol_4", "vol_16", "vol_48",
+    "volume_z_20", "volume_z_96",
+    "range_pct", "body_pct",
+    "ema_fast_distance", "ema_slow_distance", "rsi_14",
 ]
 
 
@@ -74,11 +62,15 @@ def _rsi(close: pd.Series, period: int = 14) -> pd.Series:
     avg_gain = gain.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
     avg_loss = loss.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
     rs = avg_gain / avg_loss.replace(0.0, np.nan)
-    return 100.0 - 100.0 / (1.0 + rs)
+    rsi = 100.0 - 100.0 / (1.0 + rs)
+    # A sustained one-sided market is valid data, not a missing-value condition.
+    rsi = rsi.mask((avg_loss == 0.0) & (avg_gain > 0.0), 100.0)
+    rsi = rsi.mask((avg_loss == 0.0) & (avg_gain == 0.0), 50.0)
+    return rsi
 
 
 def build_forecast_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Build causal features for next-candle forecasting on one native timeframe."""
+    """Build causal features plus the next native candle's close-return target."""
     out = df.copy().sort_index()
     close = out["close"].astype(float)
     open_ = out["open"].astype(float)
@@ -88,16 +80,17 @@ def build_forecast_features(df: pd.DataFrame) -> pd.DataFrame:
         out[f"ret_{n}"] = close.pct_change(n)
 
     ret_1 = close.pct_change()
-    out["vol_4"] = ret_1.rolling(4).std()
-    out["vol_16"] = ret_1.rolling(16).std()
-    out["vol_48"] = ret_1.rolling(48).std()
+    for n in (4, 16, 48):
+        out[f"vol_{n}"] = ret_1.rolling(n).std()
 
     for n in (20, 96):
         mean = volume.rolling(n).mean()
         std = volume.rolling(n).std().replace(0.0, np.nan)
         out[f"volume_z_{n}"] = (volume - mean) / std
 
-    out["range_pct"] = (out["high"].astype(float) - out["low"].astype(float)) / close.replace(0.0, np.nan)
+    out["range_pct"] = (
+        out["high"].astype(float) - out["low"].astype(float)
+    ) / close.replace(0.0, np.nan)
     out["body_pct"] = (close - open_) / open_.replace(0.0, np.nan)
 
     ema_8 = close.ewm(span=8, adjust=False).mean()
@@ -152,16 +145,11 @@ def forecast_next_candle(
     timeframe: str,
     cfg: ForecastConfig | None = None,
 ) -> ForecastResult:
-    """Forecast the next native candle using chronological validation only.
-
-    This is a research forecast, not a promise of future price. The model predicts
-    next-candle close return, then converts validation residuals into a rough price
-    interval and separately estimates P(up) using logistic regression.
-    """
+    """Forecast one next native candle using chronological validation only."""
     cfg = cfg or ForecastConfig()
     frame = build_forecast_features(df)
-
     latest = frame.iloc[-1]
+
     if latest[FORECAST_FEATURES].isna().any():
         raise ValueError("Not enough clean history to build the latest forecast features")
 
@@ -187,25 +175,23 @@ def forecast_next_candle(
     models = _regression_models(cfg.random_state)
     val_predictions: dict[str, np.ndarray] = {}
     maes: dict[str, float] = {}
+    y_val_np = y_val.to_numpy()
 
     for name, model in models.items():
         model.fit(X_fit, y_fit)
         pred = np.asarray(model.predict(X_val), dtype=float)
         val_predictions[name] = pred
-        maes[name] = float(np.mean(np.abs(y_val.to_numpy() - pred)))
+        maes[name] = float(np.mean(np.abs(y_val_np - pred)))
 
     inverse = {name: 1.0 / max(mae, 1e-8) for name, mae in maes.items()}
-    total_inverse = sum(inverse.values())
-    weights = {name: value / total_inverse for name, value in inverse.items()}
+    inv_total = sum(inverse.values())
+    weights = {name: value / inv_total for name, value in inverse.items()}
 
     val_ensemble = sum(val_predictions[name] * weights[name] for name in models)
-    residuals = y_val.to_numpy() - val_ensemble
+    residuals = y_val_np - val_ensemble
     lower_residual = float(np.quantile(residuals, 0.10))
     upper_residual = float(np.quantile(residuals, 0.90))
-
-    direction_accuracy = float(
-        np.mean(np.sign(val_ensemble) == np.sign(y_val.to_numpy()))
-    )
+    direction_accuracy = float(np.mean(np.sign(val_ensemble) == np.sign(y_val_np)))
     validation_mae = float(np.mean(np.abs(residuals)))
 
     current_predictions: dict[str, float] = {}
@@ -230,8 +216,9 @@ def forecast_next_candle(
 
     pred_values = np.asarray(list(current_predictions.values()), dtype=float)
     residual_scale = max(float(np.std(residuals)), 1e-8)
-    model_agreement = float(np.clip(1.0 - np.std(pred_values) / residual_scale, 0.0, 1.0))
-
+    model_agreement = float(
+        np.clip(1.0 - np.std(pred_values) / residual_scale, 0.0, 1.0)
+    )
     directional_edge = float(np.clip((direction_accuracy - 0.5) * 2.0, 0.0, 1.0))
     probability_edge = float(np.clip(abs(up_probability - 0.5) * 2.0, 0.0, 1.0))
     confidence = float(
@@ -246,10 +233,8 @@ def forecast_next_candle(
     expected_price = current_price * (1.0 + expected_return)
     lower_price = current_price * (1.0 + expected_return + lower_residual)
     upper_price = current_price * (1.0 + expected_return + upper_residual)
-    if lower_price > upper_price:
-        lower_price, upper_price = upper_price, lower_price
+    lower_price, upper_price = sorted((max(0.0, lower_price), max(0.0, upper_price)))
 
-    realized_vol = float(latest["vol_16"] * 100.0)
     expected_bps = expected_return * 10_000.0
     trend = _classify_trend(expected_bps, up_probability, cfg)
     signal = _research_signal(trend, confidence, cfg)
@@ -266,7 +251,7 @@ def forecast_next_candle(
         confidence=confidence,
         trend=trend,
         research_signal=signal,
-        realized_volatility_pct=realized_vol,
+        realized_volatility_pct=float(latest["vol_16"] * 100.0),
         validation_mae_pct=validation_mae * 100.0,
         validation_direction_accuracy=direction_accuracy,
         model_agreement=model_agreement,
