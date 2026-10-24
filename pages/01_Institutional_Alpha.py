@@ -71,6 +71,17 @@ def factor_cn(value: str) -> str:
     }.get(value, value)
 
 
+def friendly_market_error(exc: Exception) -> str:
+    text = str(exc)
+    lowered = text.lower()
+    if "network attempts" in lowered or "timeout" in lowered or "timed out" in lowered:
+        return (
+            "Gate 公共行情请求超时。程序已经自动重试，但当前网络仍未成功。"
+            "这不会影响已经保存的预测/验真记录；稍后再次点击即可。"
+        )
+    return f"行情/预测执行失败：{text}"
+
+
 @st.cache_data(ttl=60, show_spinner=False)
 def load_market(exchange: str, symbol: str, timeframe: str, bars: int, daily_timezone: str):
     return fetch_forecast_ohlcv(
@@ -144,62 +155,74 @@ forecast_cfg = ForecastConfig(**forecast_raw)
 if "institutional_result" not in st.session_state:
     st.session_state.institutional_result = None
     st.session_state.institutional_market = None
+    st.session_state.institutional_error = None
 
 if run:
-    with st.spinner(f"正在构建 {symbol} / {timeframe} 机构 Alpha..."):
-        market = load_market(exchange, symbol, timeframe, bars, daily_timezone)
-        basis = forecast_candle_basis(exchange, timeframe, daily_timezone)
-        realized = realized_model_weights(
-            results_dir,
-            symbol=symbol,
-            timeframe=timeframe,
-            candle_basis=basis,
-            min_samples=forecast_cfg.realized_weight_min_samples,
-        )
-        forecast = forecast_next_candle(
-            market,
-            timeframe=timeframe,
-            cfg=forecast_cfg,
-            realized_model_weights=realized,
-        )
-        derivatives = None
-        if exchange == "gate" and use_derivatives:
-            derivatives = load_derivatives(symbol, timeframe)
-        alpha = build_institutional_alpha(
-            market,
-            expected_return_pct=forecast.expected_return_pct,
-            model_confidence=forecast.confidence,
-            derivatives_context=derivatives,
-            market_regime=forecast.market_regime,
-        )
+    st.session_state.institutional_error = None
+    try:
+        with st.spinner(f"正在构建 {symbol} / {timeframe} 机构 Alpha..."):
+            market = load_market(exchange, symbol, timeframe, bars, daily_timezone)
+            basis = forecast_candle_basis(exchange, timeframe, daily_timezone)
+            realized = realized_model_weights(
+                results_dir,
+                symbol=symbol,
+                timeframe=timeframe,
+                candle_basis=basis,
+                min_samples=forecast_cfg.realized_weight_min_samples,
+            )
+            forecast = forecast_next_candle(
+                market,
+                timeframe=timeframe,
+                cfg=forecast_cfg,
+                realized_model_weights=realized,
+            )
+            derivatives = None
+            if exchange == "gate" and use_derivatives:
+                derivatives = load_derivatives(symbol, timeframe)
+            alpha = build_institutional_alpha(
+                market,
+                expected_return_pct=forecast.expected_return_pct,
+                model_confidence=forecast.confidence,
+                derivatives_context=derivatives,
+                market_regime=forecast.market_regime,
+            )
 
-        row = forecast.to_dict()
-        row.update(
-            {
-                "symbol": symbol,
-                "exchange": exchange,
-                "forecast_run_at": datetime.now(timezone.utc).isoformat(),
-                "candle_basis": basis,
-                "realized_model_weights": realized,
-                "institutional_alpha": alpha.to_dict(),
-            }
-        )
-        save_forecast_run([row], results_dir)
-        persist_alpha(
-            results_dir,
-            exchange=exchange,
-            symbol=symbol,
-            timeframe=timeframe,
-            as_of=forecast.as_of,
-            base_price=forecast.current_price,
-            model_expected_return_pct=forecast.expected_return_pct,
-            model_confidence=forecast.confidence,
-            alpha=alpha.to_dict(),
-            candle_basis=basis,
-            forecast_run_at=row["forecast_run_at"],
-        )
-        st.session_state.institutional_result = row
-        st.session_state.institutional_market = market
+            row = forecast.to_dict()
+            row.update(
+                {
+                    "symbol": symbol,
+                    "exchange": exchange,
+                    "forecast_run_at": datetime.now(timezone.utc).isoformat(),
+                    "candle_basis": basis,
+                    "realized_model_weights": realized,
+                    "institutional_alpha": alpha.to_dict(),
+                }
+            )
+            save_forecast_run([row], results_dir)
+            persist_alpha(
+                results_dir,
+                exchange=exchange,
+                symbol=symbol,
+                timeframe=timeframe,
+                as_of=forecast.as_of,
+                base_price=forecast.current_price,
+                model_expected_return_pct=forecast.expected_return_pct,
+                model_confidence=forecast.confidence,
+                alpha=alpha.to_dict(),
+                candle_basis=basis,
+                forecast_run_at=row["forecast_run_at"],
+            )
+            st.session_state.institutional_result = row
+            st.session_state.institutional_market = market
+    except Exception as exc:
+        st.session_state.institutional_error = friendly_market_error(exc)
+
+if st.session_state.institutional_error:
+    st.error(st.session_state.institutional_error)
+    st.caption(
+        "网络问题不会写入一条新的正式预测。已有 SQLite 历史仍保留；"
+        "如果使用代理/VPN，也请确认 Python 进程能够访问 Gate 公共 API。"
+    )
 
 row = st.session_state.institutional_result
 market = st.session_state.institutional_market
