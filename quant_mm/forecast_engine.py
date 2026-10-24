@@ -30,6 +30,7 @@ class ForecastConfig:
     random_state: int = 42
     use_advanced_models: bool = True
     realized_weight_blend: float = 0.65
+    realized_weight_min_samples: int = 30
 
 
 @dataclass(frozen=True)
