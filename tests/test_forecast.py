@@ -40,8 +40,8 @@ def test_forecast_uses_latest_closed_candle_close_as_base_price():
     assert pd.Timestamp(result.as_of) == market.index[-1]
 
 
-def test_forecast_returns_probabilistic_metadata():
-    cfg = ForecastConfig(min_train_rows=500, train_window=1200)
+def test_forecast_returns_advanced_ensemble_metadata():
+    cfg = ForecastConfig(min_train_rows=500, train_window=1200, use_advanced_models=True)
     result = forecast_next_candle(synthetic_market(), "15m", cfg)
 
     assert result.current_price > 0
@@ -49,9 +49,42 @@ def test_forecast_returns_probabilistic_metadata():
     assert 0.0 <= result.up_probability <= 1.0
     assert 0.0 <= result.confidence <= 1.0
     assert 0.0 <= result.model_agreement <= 1.0
-    assert set(result.model_predictions_pct) == {"linear", "ridge", "hist_gb"}
+    assert set(result.model_predictions_pct) == {
+        "linear",
+        "ridge",
+        "hist_gb",
+        "elastic_net",
+        "extra_trees",
+    }
     assert abs(sum(result.model_weights.values()) - 1.0) < 1e-9
+    assert abs(sum(result.validation_model_weights.values()) - 1.0) < 1e-9
+    assert result.weighting_mode == "validation_only"
+    assert result.market_regime in {"TREND_UP", "TREND_DOWN", "RANGE", "HIGH_VOL"}
     assert result.training_rows >= 500
+
+
+def test_advanced_models_can_be_disabled_for_baseline_comparison():
+    cfg = ForecastConfig(min_train_rows=500, train_window=1200, use_advanced_models=False)
+    result = forecast_next_candle(synthetic_market(), "15m", cfg)
+    assert set(result.model_predictions_pct) == {"linear", "ridge", "hist_gb"}
+
+
+def test_realized_weights_are_blended_after_external_score_is_available():
+    cfg = ForecastConfig(
+        min_train_rows=500,
+        train_window=1200,
+        use_advanced_models=False,
+        realized_weight_blend=0.70,
+    )
+    result = forecast_next_candle(
+        synthetic_market(),
+        "15m",
+        cfg,
+        realized_model_weights={"linear": 0.80, "ridge": 0.15, "hist_gb": 0.05},
+    )
+    assert result.weighting_mode == "validation_plus_realized"
+    assert result.model_weights["linear"] > result.validation_model_weights["linear"]
+    assert abs(sum(result.model_weights.values()) - 1.0) < 1e-9
 
 
 def test_positive_drift_does_not_produce_invalid_signal():
