@@ -17,12 +17,12 @@ from quant_mm.dashboard_utils import (
 )
 from quant_mm.data import (
     fetch_closed_candle,
-    fetch_forecast_ohlcv,
     fetch_last_price,
     forecast_candle_basis,
 )
 from quant_mm.forecast_engine import ForecastConfig, forecast_next_candle
 from quant_mm.forecast_store import accuracy_summary, settle_due_forecasts, store_status
+from quant_mm.market_cache import load_cached_forecast_ohlcv
 from quant_mm.model_performance import model_performance_table, realized_model_weights
 
 
@@ -36,13 +36,17 @@ def load_market_data(
     timeframe: str,
     bars: int,
     daily_timezone: str,
+    use_cache: bool,
+    cache_dir: str,
 ) -> pd.DataFrame:
-    return fetch_forecast_ohlcv(
+    return load_cached_forecast_ohlcv(
         exchange,
         symbol,
         timeframe,
         bars,
         daily_timezone=daily_timezone,
+        use_cache=use_cache,
+        cache_dir=cache_dir,
     )
 
 
@@ -123,6 +127,8 @@ def run_forecasts(
     cfg: ForecastConfig,
     results_dir: str,
     daily_timezone: str,
+    use_cache: bool,
+    cache_dir: str,
 ) -> tuple[list[dict], dict[str, pd.DataFrame], list[str]]:
     run_at = datetime.now(timezone.utc).isoformat()
     results: list[dict] = []
@@ -137,6 +143,8 @@ def run_forecasts(
                 timeframe,
                 bars,
                 daily_timezone,
+                use_cache,
+                cache_dir,
             )
             candle_basis = forecast_candle_basis(
                 exchange,
@@ -251,6 +259,8 @@ time_cfg = config.get("time", {}) or {}
 daily_timezone = str(time_cfg.get("daily_candle_timezone", "UTC"))
 display_timezone = str(time_cfg.get("display_timezone", "Asia/Shanghai"))
 base_forecast_cfg = config.get("forecast", {}) or {}
+market_data_cfg = config.get("market_data", {}) or {}
+cache_dir = str(market_data_cfg.get("cache_dir", "data/cache/ohlcv"))
 
 with st.sidebar:
     st.header("预测设置")
@@ -320,9 +330,17 @@ with st.sidebar:
             max_value=10000,
             value=int(config.get("bars", 5000)),
             step=500,
-            help="使用交易所能够提供的最近已收盘 K 线；超出数据源历史范围时会自动缩到可用窗口。",
+            help="这是本次模型最多使用的最近已收盘 K 线数量。本地缓存会长期增长，不会每次截成这个数量。",
         )
     )
+
+    use_cache = st.checkbox(
+        "启用本地 K 线缓存",
+        value=bool(market_data_cfg.get("use_cache", True)),
+        help="第一次下载完整窗口，之后只增量补最新 K 线；缓存保存在 data/cache/ohlcv。",
+    )
+    if use_cache:
+        st.caption(f"本地缓存目录：`{cache_dir}`")
 
     with st.expander("高级模型参数"):
         train_window = int(
@@ -385,6 +403,47 @@ with st.sidebar:
             )
         )
 
+        st.markdown("##### 训练样本时间权重")
+        recency_enabled = st.checkbox(
+            "让最近 K 线拥有更高训练权重",
+            value=float(base_forecast_cfg.get("recency_half_life_bars", 0.0)) > 0.0,
+        )
+        default_half_life = int(max(100, float(base_forecast_cfg.get("recency_half_life_bars", 1500) or 1500)))
+        recency_half_life_bars = float(
+            st.number_input(
+                "时间衰减 Half-Life（根）",
+                min_value=100,
+                max_value=10000,
+                value=default_half_life,
+                step=100,
+                disabled=not recency_enabled,
+                help="例如 1500：比最新样本早 1500 根的训练样本权重约为一半。",
+            )
+        ) if recency_enabled else 0.0
+
+        st.markdown("##### 模型手动偏好倍率")
+        manual_enabled = st.checkbox(
+            "启用手动模型倍率",
+            value=bool(base_forecast_cfg.get("manual_model_multipliers")),
+            help="倍率会叠加在自动验证/真实战绩权重上，再重新归一化。范围限制为 0.25x~2.0x。",
+        )
+        configured_multipliers = base_forecast_cfg.get("manual_model_multipliers", {}) or {}
+        model_multiplier_names = ["linear", "ridge", "hist_gb", "elastic_net", "extra_trees"]
+        manual_model_multipliers: dict[str, float] = {}
+        for model_name in model_multiplier_names:
+            if model_name in {"elastic_net", "extra_trees"} and not use_advanced_models:
+                continue
+            multiplier = st.slider(
+                f"{model_name} 倍率",
+                min_value=0.25,
+                max_value=2.0,
+                value=float(configured_multipliers.get(model_name, 1.0)),
+                step=0.05,
+                disabled=not manual_enabled,
+                key=f"manual_multiplier_{model_name}",
+            )
+            manual_model_multipliers[model_name] = float(multiplier if manual_enabled else 1.0)
+
     run_button = st.button("开始预测", type="primary", use_container_width=True)
     verify_button = st.button("立即验真到期预测", use_container_width=True)
     st.caption("页面打开时每 60 秒自动检查一次已经到期的预测。")
@@ -400,6 +459,8 @@ forecast_cfg = ForecastConfig(
     use_advanced_models=use_advanced_models,
     realized_weight_blend=realized_weight_blend,
     realized_weight_min_samples=realized_weight_min_samples,
+    recency_half_life_bars=recency_half_life_bars,
+    manual_model_multipliers=manual_model_multipliers if manual_enabled else {},
 )
 
 if "forecast_results" not in st.session_state:
@@ -442,6 +503,8 @@ if run_button:
                 cfg=forecast_cfg,
                 results_dir=results_dir,
                 daily_timezone=daily_timezone,
+                use_cache=use_cache,
+                cache_dir=cache_dir,
             )
         st.session_state.forecast_results = results
         st.session_state.market_data = market_data
@@ -519,15 +582,36 @@ else:
             )
             c8.metric("置信度", f"{row['confidence']:.1%}")
 
+            market = market_data.get(row["timeframe"])
+            if market is not None:
+                refresh_mode = market.attrs.get("cache_refresh_mode", "-")
+                cache_rows = market.attrs.get("cache_rows_total", len(market))
+                downloaded = market.attrs.get("downloaded_rows_this_run", 0)
+                missing = market.attrs.get("missing_intervals", 0)
+                cache_path = market.attrs.get("cache_path", "-")
+                st.caption(
+                    f"数据缓存：{refresh_mode} ｜ 本地累计 {cache_rows} 根 ｜ "
+                    f"本次网络获取 {downloaded} 根 ｜ 缺口 {missing} ｜ `{cache_path}`"
+                )
+                if refresh_mode == "offline_cache":
+                    st.warning("交易所刷新失败，本次使用仍满足时效要求的本地缓存。请留意网络状态。")
+
             weight_label = (
                 "验证集 + 真实战绩"
-                if row.get("weighting_mode") == "validation_plus_realized"
+                if "validation_plus_realized" in row.get("weighting_mode", "")
                 else "仅时间序列验证集"
+            )
+            if "plus_manual" in row.get("weighting_mode", ""):
+                weight_label += " + 手动倍率"
+            recency_text = (
+                f"Half-Life {row.get('recency_half_life_bars', 0):.0f} 根"
+                if float(row.get("recency_half_life_bars", 0.0)) > 0.0
+                else "关闭"
             )
             st.caption(
                 f"历史方向验证准确率：{row['validation_direction_accuracy']:.1%} ｜ "
                 f"模型一致度：{row['model_agreement']:.1%} ｜ "
-                f"权重来源：{weight_label} ｜ 训练样本：{row['training_rows']}"
+                f"权重来源：{weight_label} ｜ 时间衰减：{recency_text} ｜ 训练样本：{row['training_rows']}"
             )
 
             if display_mode in {"综合预测", "价格目标与区间"}:
@@ -538,7 +622,6 @@ else:
                     f"｜ **验证 MAE：** `{row['validation_mae_pct']:.3f}%`"
                 )
 
-            market = market_data.get(row["timeframe"])
             if market is not None and not market.empty:
                 projection = build_price_projection(
                     market,
@@ -570,6 +653,7 @@ else:
                             "模型": model_name,
                             "预测收益率(%)": pred_pct,
                             "验证集权重(%)": row.get("validation_model_weights", {}).get(model_name, 0.0) * 100.0,
+                            "手动倍率": row.get("manual_model_multipliers", {}).get(model_name, 1.0),
                             "最终权重(%)": row["model_weights"].get(model_name, 0.0) * 100.0,
                         }
                     )
