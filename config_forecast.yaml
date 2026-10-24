@@ -13,6 +13,14 @@ timeframes:
 bars: 5000
 results_dir: results/forecast
 
+# Forecast clock policy.
+# - Intraday candles keep exchange-native boundaries.
+# - 1d candles are rebuilt as natural Beijing days: 00:00 -> next-day 00:00.
+# - Dashboard timestamps are shown in Beijing time so the base/target window is explicit.
+time:
+  daily_candle_timezone: Asia/Shanghai
+  display_timezone: Asia/Shanghai
+
 forecast:
   train_window: 5000
   min_train_rows: 700
