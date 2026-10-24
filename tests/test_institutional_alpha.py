@@ -3,7 +3,12 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from quant_mm.alpha_store import factor_leaderboard, persist_alpha, settle_due_alpha
+from quant_mm.alpha_store import (
+    alpha_summary,
+    factor_leaderboard,
+    persist_alpha,
+    settle_due_alpha,
+)
 from quant_mm.institutional_alpha import build_institutional_alpha
 
 
@@ -100,6 +105,7 @@ def test_alpha_store_deduplicates_same_target_and_settles(tmp_path):
         model_expected_return_pct=0.25,
         model_confidence=0.70,
         alpha=alpha,
+        candle_basis="exchange_native_closed",
     )
     duplicate = persist_alpha(
         tmp_path,
@@ -111,6 +117,7 @@ def test_alpha_store_deduplicates_same_target_and_settles(tmp_path):
         model_expected_return_pct=0.25,
         model_confidence=0.70,
         alpha=alpha,
+        candle_basis="exchange_native_closed",
     )
     assert first == 1
     assert duplicate == 0
@@ -137,6 +144,61 @@ def test_alpha_store_deduplicates_same_target_and_settles(tmp_path):
         tmp_path,
         symbol="BTC/USDT",
         timeframe="15m",
+        candle_basis="exchange_native_closed",
     )
     assert not board.empty
     assert set(board.columns) == {"factor", "samples", "direction_accuracy", "avg_signed_edge"}
+
+
+def test_alpha_summary_separates_daily_candle_basis(tmp_path):
+    alpha = build_institutional_alpha(
+        synthetic_market(),
+        expected_return_pct=0.25,
+        model_confidence=0.70,
+        derivatives_context=derivative_context(),
+        market_regime="TREND_UP",
+    ).to_dict()
+
+    persist_alpha(
+        tmp_path,
+        exchange="gate",
+        symbol="BTC/USDT",
+        timeframe="1d",
+        as_of=pd.Timestamp("2026-10-20T00:00:00Z"),
+        base_price=100.0,
+        model_expected_return_pct=0.25,
+        model_confidence=0.70,
+        alpha=alpha,
+        candle_basis="gate_native_utc_day",
+    )
+    persist_alpha(
+        tmp_path,
+        exchange="gate",
+        symbol="BTC/USDT",
+        timeframe="1d",
+        as_of=pd.Timestamp("2026-10-20T16:00:00Z"),
+        base_price=100.0,
+        model_expected_return_pct=0.25,
+        model_confidence=0.70,
+        alpha=alpha,
+        candle_basis="natural_day:Asia/Shanghai",
+    )
+
+    def candle_fetcher(exchange, symbol, timeframe, target_open_at):
+        return {"close": 101.0}
+
+    settled = settle_due_alpha(
+        tmp_path,
+        candle_fetcher,
+        now=pd.Timestamp("2026-10-23T00:00:00Z"),
+        limit=10,
+    )
+    assert settled["settled"] == 2
+
+    summary = alpha_summary(tmp_path, symbol="BTC/USDT")
+    daily = summary[summary["timeframe"] == "1d"]
+    assert set(daily["candle_basis"]) == {
+        "gate_native_utc_day",
+        "natural_day:Asia/Shanghai",
+    }
+    assert len(daily) == 2
