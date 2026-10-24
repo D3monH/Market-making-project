@@ -25,7 +25,7 @@ def _initial_since_ms(now_ms: int, timeframe_ms: int, bars: int) -> int:
     The caller must still paginate all the way to `now_ms`; the buffer is not a
     reason to stop once `bars` rows have been collected.
     """
-    return int(now_ms - bars * timeframe_ms * 1.10)
+    return now_ms - int(bars * timeframe_ms * 1.10)
 
 
 def _create_exchange(exchange_id: str):
