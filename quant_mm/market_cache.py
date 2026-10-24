@@ -6,6 +6,7 @@ import math
 import pandas as pd
 
 from .data import (
+    ensure_recent_closed_data,
     fetch_forecast_ohlcv,
     forecast_candle_basis,
     load_csv,
@@ -87,10 +88,9 @@ def load_cached_forecast_ohlcv(
     a small recent overlap. The overlap is merged/deduplicated so revisions and
     boundary candles are refreshed safely.
 
-    If the cached training tail contains an internal gap, the function performs
-    one full recent-window refresh before returning. The cache itself is never
-    truncated to ``bars``; it grows over time and can therefore support later
-    experiments with larger training windows without re-downloading old data.
+    A recent cache can be used temporarily if the exchange is unreachable. A
+    stale cache is still rejected by ``ensure_recent_closed_data`` so an offline
+    fallback can never silently generate a formal forecast from old candles.
     """
     if bars <= 0:
         raise ValueError("bars must be greater than zero")
@@ -99,6 +99,7 @@ def load_cached_forecast_ohlcv(
     cached = _read_cache(path) if use_cache else _empty_frame()
     downloaded_rows = 0
     refresh_mode = "network_only"
+    refresh_error: str | None = None
 
     if not use_cache or cached.empty:
         fresh = fetch_forecast_ohlcv(
@@ -125,40 +126,46 @@ def load_cached_forecast_ohlcv(
         refresh_bars = max(int(refresh_floor_bars), possible_new + 6)
         refresh_bars = min(max(refresh_bars, 1), max(int(bars), 1000))
 
-        fresh = fetch_forecast_ohlcv(
-            exchange,
-            symbol,
-            timeframe,
-            refresh_bars,
-            daily_timezone=daily_timezone,
-        )
-        downloaded_rows = len(fresh)
-        merged = _merge_frames(cached, fresh)
-        refresh_mode = "incremental"
-
-        # If the requested training tail still contains gaps, repair that tail
-        # with one full recent-window download. This is intentionally exceptional
-        # rather than the normal path so ordinary refreshes stay lightweight.
-        requested_tail = merged.tail(bars)
-        if _missing_intervals(requested_tail, timeframe) > 0:
-            repair = fetch_forecast_ohlcv(
+        try:
+            fresh = fetch_forecast_ohlcv(
                 exchange,
                 symbol,
                 timeframe,
-                bars,
+                refresh_bars,
                 daily_timezone=daily_timezone,
             )
-            downloaded_rows += len(repair)
-            merged = _merge_frames(merged, repair)
-            refresh_mode = "gap_repair"
+            downloaded_rows = len(fresh)
+            merged = _merge_frames(cached, fresh)
+            refresh_mode = "incremental"
 
-    if use_cache:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        save_cache(merged, path)
+            requested_tail = merged.tail(bars)
+            if _missing_intervals(requested_tail, timeframe) > 0:
+                repair = fetch_forecast_ohlcv(
+                    exchange,
+                    symbol,
+                    timeframe,
+                    bars,
+                    daily_timezone=daily_timezone,
+                )
+                downloaded_rows += len(repair)
+                merged = _merge_frames(merged, repair)
+                refresh_mode = "gap_repair"
+        except Exception as exc:
+            merged = cached.copy()
+            refresh_mode = "offline_cache"
+            refresh_error = str(exc)
 
     result = merged.tail(bars).copy()
     if result.empty:
         raise RuntimeError(f"No cached OHLCV available for {symbol} / {timeframe}")
+
+    # Formal predictions are allowed only when the resulting tail is still
+    # recent enough for the selected candle period.
+    ensure_recent_closed_data(result, timeframe)
+
+    if use_cache and refresh_mode != "offline_cache":
+        path.parent.mkdir(parents=True, exist_ok=True)
+        save_cache(merged, path)
 
     result.attrs["cache_enabled"] = bool(use_cache)
     result.attrs["cache_path"] = str(path)
@@ -167,6 +174,7 @@ def load_cached_forecast_ohlcv(
     result.attrs["returned_bars"] = int(len(result))
     result.attrs["downloaded_rows_this_run"] = int(downloaded_rows)
     result.attrs["cache_refresh_mode"] = refresh_mode
+    result.attrs["cache_refresh_error"] = refresh_error
     result.attrs["missing_intervals"] = _missing_intervals(result, timeframe)
     result.attrs["last_candle_open_at"] = pd.Timestamp(result.index[-1]).isoformat()
     result.attrs["candle_basis"] = forecast_candle_basis(
