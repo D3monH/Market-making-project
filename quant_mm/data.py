@@ -49,6 +49,15 @@ def _create_exchange(exchange_id: str):
     return exchange, resolved_exchange_id
 
 
+def _utc_timestamp(value) -> pd.Timestamp:
+    ts = pd.Timestamp(value)
+    if ts.tzinfo is None:
+        ts = ts.tz_localize("UTC")
+    else:
+        ts = ts.tz_convert("UTC")
+    return ts
+
+
 def load_csv(path: str | Path) -> pd.DataFrame:
     df = pd.read_csv(path)
     missing = set(COLUMNS) - set(df.columns)
@@ -76,6 +85,54 @@ def fetch_last_price(exchange_id: str, symbol: str) -> float:
     if price is None:
         raise RuntimeError(f"No latest ticker price returned for {symbol} on {resolved_exchange_id}")
     return float(price)
+
+
+def fetch_closed_candle(
+    exchange_id: str,
+    symbol: str,
+    timeframe: str,
+    candle_open_at,
+) -> dict | None:
+    """Fetch one exact historical candle after it has fully closed.
+
+    `candle_open_at` is the UTC open timestamp of the candle being verified.
+    Returns None while the candle is still forming or when the exchange has not
+    made that candle available yet.
+    """
+    exchange, resolved_exchange_id = _create_exchange(exchange_id)
+    if not exchange.has.get("fetchOHLCV"):
+        raise ValueError(f"{resolved_exchange_id} does not support fetchOHLCV through CCXT")
+
+    timeframe_ms = int(exchange.parse_timeframe(timeframe) * 1000)
+    target_ts = _utc_timestamp(candle_open_at)
+    target_ms = int(target_ts.timestamp() * 1000)
+    now_ms = int(exchange.milliseconds())
+    if target_ms + timeframe_ms > now_ms:
+        return None
+
+    batch = exchange.fetch_ohlcv(
+        symbol,
+        timeframe=timeframe,
+        since=target_ms,
+        limit=5,
+    )
+    if not batch:
+        return None
+
+    row = next((item for item in batch if int(item[0]) == target_ms), None)
+    if row is None:
+        return None
+    if int(row[0]) + timeframe_ms > int(exchange.milliseconds()):
+        return None
+
+    return {
+        "timestamp": pd.to_datetime(int(row[0]), unit="ms", utc=True).isoformat(),
+        "open": float(row[1]),
+        "high": float(row[2]),
+        "low": float(row[3]),
+        "close": float(row[4]),
+        "volume": float(row[5]),
+    }
 
 
 def fetch_ohlcv(exchange_id: str, symbol: str, timeframe: str, bars: int) -> pd.DataFrame:
