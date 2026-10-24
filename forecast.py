@@ -10,7 +10,11 @@ from quant_mm.dashboard_utils import (
     format_display_timestamp,
     save_forecast_run,
 )
-from quant_mm.data import fetch_closed_candle, fetch_forecast_ohlcv
+from quant_mm.data import (
+    fetch_closed_candle,
+    fetch_forecast_ohlcv,
+    forecast_candle_basis,
+)
 from quant_mm.forecast_engine import ForecastConfig, forecast_next_candle
 from quant_mm.forecast_store import settle_due_forecasts, store_status
 from quant_mm.model_performance import realized_model_weights
@@ -29,14 +33,6 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def candle_basis_for(timeframe: str, daily_timezone: str) -> str:
-    return (
-        f"natural_day:{daily_timezone}"
-        if timeframe == "1d"
-        else "exchange_native_closed"
-    )
-
-
 def main() -> None:
     args = parse_args()
     cfg = load_config(args.config)
@@ -48,7 +44,7 @@ def main() -> None:
     forecast_cfg = ForecastConfig(**cfg.get("forecast", {}))
     results_dir = cfg.get("results_dir", "results/forecast")
     time_cfg = cfg.get("time", {}) or {}
-    daily_timezone = str(time_cfg.get("daily_candle_timezone", "Asia/Shanghai"))
+    daily_timezone = str(time_cfg.get("daily_candle_timezone", "UTC"))
     display_timezone = str(time_cfg.get("display_timezone", "Asia/Shanghai"))
 
     settlement = settle_due_forecasts(
@@ -68,7 +64,10 @@ def main() -> None:
     print("Crypto Multi-Horizon Forecast Engine - research only")
     print("Models: Linear + Ridge + HistGradientBoosting + ElasticNet + ExtraTrees + Logistic direction")
     print(f"Display timezone: {display_timezone}")
-    print(f"1d candle boundary: natural day in {daily_timezone}")
+    if str(exchange).lower() in {"gate", "gateio"}:
+        print("Gate 1d boundary: native UTC day; displayed in Beijing as 08:00 -> next-day 08:00")
+    else:
+        print("1d candle boundary: exchange-native daily candle")
     print("=" * 96)
 
     for symbol in symbols:
@@ -82,7 +81,11 @@ def main() -> None:
                     bars,
                     daily_timezone=daily_timezone,
                 )
-                candle_basis = candle_basis_for(timeframe, daily_timezone)
+                candle_basis = forecast_candle_basis(
+                    exchange,
+                    timeframe,
+                    daily_timezone,
+                )
                 live_weights = realized_model_weights(
                     results_dir,
                     symbol=symbol,

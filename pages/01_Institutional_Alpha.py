@@ -15,7 +15,12 @@ from quant_mm.alpha_store import (
     settle_due_alpha,
 )
 from quant_mm.dashboard_utils import forecast_window, format_display_timestamp, save_forecast_run
-from quant_mm.data import fetch_closed_candle, fetch_forecast_ohlcv, fetch_last_price
+from quant_mm.data import (
+    fetch_closed_candle,
+    fetch_forecast_ohlcv,
+    fetch_last_price,
+    forecast_candle_basis,
+)
 from quant_mm.forecast_engine import ForecastConfig, forecast_next_candle
 from quant_mm.forecast_store import settle_due_forecasts
 from quant_mm.institutional_alpha import (
@@ -32,10 +37,6 @@ def load_config() -> dict:
         return {}
     with CONFIG_PATH.open("r", encoding="utf-8") as f:
         return yaml.safe_load(f) or {}
-
-
-def candle_basis_for(timeframe: str, daily_timezone: str) -> str:
-    return f"natural_day:{daily_timezone}" if timeframe == "1d" else "exchange_native_closed"
 
 
 def signal_cn(value: str) -> str:
@@ -100,7 +101,7 @@ st.caption(
 cfg = load_config()
 results_dir = str(cfg.get("results_dir", "results/forecast"))
 time_cfg = cfg.get("time", {}) or {}
-daily_timezone = str(time_cfg.get("daily_candle_timezone", "Asia/Shanghai"))
+daily_timezone = str(time_cfg.get("daily_candle_timezone", "UTC"))
 display_timezone = str(time_cfg.get("display_timezone", "Asia/Shanghai"))
 forecast_raw = cfg.get("forecast", {}) or {}
 alpha_cfg = cfg.get("institutional_alpha", {}) or {}
@@ -121,6 +122,7 @@ with st.sidebar:
             max_value=10000,
             value=int(cfg.get("bars", 5000)),
             step=500,
+            help="使用交易所最近已收盘 K 线；超过数据源历史范围时会自动缩到可用窗口。",
         )
     )
     use_derivatives = st.checkbox(
@@ -128,7 +130,13 @@ with st.sidebar:
         value=bool(alpha_cfg.get("use_gate_derivatives", True)),
         help="读取公开 Funding、Open Interest、合约溢价、多空比和盘口数据；不需要 API Key。",
     )
-    st.caption("非 Gate 数据源时，价格模型仍可运行；Gate 衍生品 Alpha 仅在 Gate 上启用。")
+    if exchange == "gate" and timeframe == "1d":
+        st.caption(
+            "Gate 1d 使用交易所原生日 K：UTC 00:00→次日 00:00；"
+            "北京时间显示为 **08:00→次日 08:00**。"
+        )
+    else:
+        st.caption("非 Gate 数据源时，价格模型仍可运行；Gate 衍生品 Alpha 仅在 Gate 上启用。")
     run = st.button("运行机构版预测", type="primary", use_container_width=True)
 
 forecast_cfg = ForecastConfig(**forecast_raw)
@@ -140,7 +148,7 @@ if "institutional_result" not in st.session_state:
 if run:
     with st.spinner(f"正在构建 {symbol} / {timeframe} 机构 Alpha..."):
         market = load_market(exchange, symbol, timeframe, bars, daily_timezone)
-        basis = candle_basis_for(timeframe, daily_timezone)
+        basis = forecast_candle_basis(exchange, timeframe, daily_timezone)
         realized = realized_model_weights(
             results_dir,
             symbol=symbol,
@@ -187,6 +195,7 @@ if run:
             model_expected_return_pct=forecast.expected_return_pct,
             model_confidence=forecast.confidence,
             alpha=alpha.to_dict(),
+            candle_basis=basis,
             forecast_run_at=row["forecast_run_at"],
         )
         st.session_state.institutional_result = row
@@ -212,6 +221,10 @@ else:
         f"模型基准使用 **{base_close} 已收盘价格 {row['current_price']:,.4f}**，"
         f"目标是 **{target_close} 收盘价**。实时价只做参考。"
     )
+    if row["timeframe"] == "1d" and row["exchange"] == "gate":
+        st.caption(
+            "Gate 原生 1d 按 UTC 日界线；当前页面显示北京时间，因此上一根/目标日线都在 **08:00** 收盘。"
+        )
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("模型预测下一收盘", f"{row['expected_price']:,.4f}", delta=f"{row['expected_return_pct']:+.3f}%")
@@ -226,6 +239,7 @@ else:
     c8.metric("实时价（仅参考）", f"{live_price:,.4f}" if live_price is not None else "获取失败")
 
     st.caption(
+        f"K线口径：{row.get('candle_basis', '-')} ｜ "
         f"Alpha 数据完整度：{alpha['data_quality']:.1%} ｜ 来源：{alpha['source']} ｜ "
         "机构共识不会回写修改模型的预测收盘价，避免尚未验真的衍生品因子污染价格模型。"
     )
@@ -301,27 +315,42 @@ def alpha_verification_panel():
         shown["有效信号命中率"] = shown["signal_accuracy"].map(lambda x: f"{x:.1%}" if pd.notna(x) else "-")
         shown["平均置信度"] = shown["avg_confidence"].map(lambda x: f"{x:.1%}" if pd.notna(x) else "-")
         shown["数据完整度"] = shown["avg_data_quality"].map(lambda x: f"{x:.1%}" if pd.notna(x) else "-")
-        shown = shown.rename(columns={"symbol": "币种", "timeframe": "周期", "samples": "样本"})
+        shown = shown.rename(
+            columns={
+                "symbol": "币种",
+                "timeframe": "周期",
+                "candle_basis": "K线口径",
+                "samples": "样本",
+            }
+        )
         st.dataframe(
-            shown[["币种", "周期", "样本", "方向命中率", "有效信号命中率", "平均置信度", "数据完整度"]],
+            shown[["币种", "周期", "K线口径", "样本", "方向命中率", "有效信号命中率", "平均置信度", "数据完整度"]],
             use_container_width=True,
             hide_index=True,
         )
 
-    board = factor_leaderboard(results_dir, symbol=symbol, timeframe=timeframe, limit=500)
+    current_basis = forecast_candle_basis(exchange, timeframe, daily_timezone)
+    board = factor_leaderboard(
+        results_dir,
+        symbol=symbol,
+        timeframe=timeframe,
+        candle_basis=current_basis,
+        limit=500,
+    )
     if not board.empty:
         display = board.copy()
         display["方向命中率"] = display["direction_accuracy"].map(lambda x: f"{x:.1%}")
         display["因子"] = display["factor"].map(factor_cn)
         display = display.rename(columns={"samples": "样本", "avg_signed_edge": "平均有符号收益贡献"})
         st.markdown(f"#### {symbol} / {timeframe} Alpha 因子真实排行榜")
+        st.caption(f"当前排行榜只统计 K 线口径：`{current_basis}`")
         st.dataframe(
             display[["因子", "样本", "方向命中率", "平均有符号收益贡献"]],
             use_container_width=True,
             hide_index=True,
         )
     else:
-        st.caption("当前还没有足够已验真的 Alpha 历史。继续运行后这里会形成因子排行榜。")
+        st.caption("当前口径还没有足够已验真的 Alpha 历史。继续运行后这里会形成因子排行榜。")
 
     history = alpha_history(results_dir, limit=100)
     if not history.empty:
@@ -332,9 +361,10 @@ def alpha_verification_panel():
             )
             shown["共识信号"] = shown["consensus_signal"].map(signal_cn)
             shown["方向命中"] = shown["direction_correct"].map({1.0: "✅", 0.0: "❌", 1: "✅", 0: "❌"})
+            shown["K线口径"] = shown["candle_basis"].fillna("legacy_alpha_unversioned")
             st.markdown("#### 最近 Alpha 记录")
             st.dataframe(
-                shown[["timeframe", "目标收盘时间", "status", "composite_score", "共识信号", "actual_return_pct", "方向命中"]].head(50),
+                shown[["timeframe", "K线口径", "目标收盘时间", "status", "composite_score", "共识信号", "actual_return_pct", "方向命中"]].head(50),
                 use_container_width=True,
                 hide_index=True,
             )

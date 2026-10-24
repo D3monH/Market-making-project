@@ -10,6 +10,7 @@ from quant_mm.dashboard_utils import forecast_window, format_display_timestamp
 from quant_mm.data import (
     ensure_recent_closed_data,
     fetch_closed_candle,
+    forecast_candle_basis,
     resample_daily_ohlcv,
 )
 
@@ -36,7 +37,7 @@ def _four_hour_market(days: int = 3) -> pd.DataFrame:
     return pd.DataFrame(rows, index=idx)
 
 
-def test_beijing_daily_resample_uses_natural_midnight_boundaries():
+def test_legacy_beijing_daily_resample_is_retained_for_old_records():
     base = _four_hour_market(days=3)
     daily = resample_daily_ohlcv(
         base,
@@ -46,7 +47,6 @@ def test_beijing_daily_resample_uses_natural_midnight_boundaries():
     )
 
     assert len(daily) == 3
-    # Beijing 00:00 is previous-day 16:00 UTC.
     assert daily.index[0] == pd.Timestamp("2026-10-21T16:00:00Z")
     assert daily.index[1] == pd.Timestamp("2026-10-22T16:00:00Z")
     assert daily.index[2] == pd.Timestamp("2026-10-23T16:00:00Z")
@@ -59,7 +59,7 @@ def test_beijing_daily_resample_uses_natural_midnight_boundaries():
     assert first["volume"] == pytest.approx(sum(10.0 + i for i in range(6)))
 
 
-def test_beijing_daily_resample_drops_current_incomplete_day():
+def test_legacy_beijing_daily_resample_drops_current_incomplete_day():
     base = _four_hour_market(days=2).iloc[:7]
     daily = resample_daily_ohlcv(
         base,
@@ -84,15 +84,17 @@ def test_15m_forecast_window_matches_beijing_2015_to_2030_example():
     ) == "2026-10-24 20:30"
 
 
-def test_beijing_daily_forecast_window_closes_at_local_midnight():
-    # Beijing day 2026-10-23 opens at 2026-10-22 16:00 UTC.
-    window = forecast_window("2026-10-22T16:00:00Z", "1d")
+def test_gate_native_daily_forecast_window_closes_at_beijing_0800():
+    # Gate native 1d candle opens at UTC 00:00. In Beijing that is 08:00.
+    window = forecast_window("2026-10-23T00:00:00Z", "1d")
     assert format_display_timestamp(
         window["base_close_at"], "Asia/Shanghai"
-    ) == "2026-10-24 00:00"
+    ) == "2026-10-24 08:00"
     assert format_display_timestamp(
         window["target_close_at"], "Asia/Shanghai"
-    ) == "2026-10-25 00:00"
+    ) == "2026-10-25 08:00"
+    assert forecast_candle_basis("gate", "1d") == "gate_native_utc_day"
+    assert forecast_candle_basis("gate", "15m") == "exchange_native_closed"
 
 
 def test_stale_forecast_input_is_rejected():
@@ -101,15 +103,61 @@ def test_stale_forecast_input_is_rejected():
         index=pd.DatetimeIndex([pd.Timestamp("2026-10-24T12:00:00Z")]),
     )
 
-    # Latest 15m candle closes at 12:15 UTC. At 12:29 it is still the correct
-    # most recent completed candle because 12:15-12:30 is still forming.
     ensure_recent_closed_data(frame, "15m", now="2026-10-24T12:29:00Z")
 
     with pytest.raises(RuntimeError, match="stale"):
         ensure_recent_closed_data(frame, "15m", now="2026-10-24T12:40:00Z")
 
 
-def test_daily_verification_aggregates_exact_stored_24h_window(monkeypatch):
+def test_native_daily_verification_fetches_exchange_1d(monkeypatch):
+    target = pd.Timestamp("2026-10-23T00:00:00Z")
+    target_ms = int(target.timestamp() * 1000)
+    day_ms = 24 * 60 * 60 * 1000
+    row = [target_ms, 200.0, 207.0, 198.0, 205.5, 615.0]
+
+    class FakeGate:
+        rateLimit = 0
+        has = {"fetchOHLCV": True, "fetchTicker": True}
+
+        def __init__(self, _config):
+            pass
+
+        def load_markets(self):
+            return None
+
+        def parse_timeframe(self, timeframe):
+            assert timeframe == "1d"
+            return 24 * 60 * 60
+
+        def milliseconds(self):
+            return target_ms + day_ms + 1
+
+        def fetch_ohlcv(self, symbol, timeframe, since, limit):
+            assert symbol == "BTC/USDT"
+            assert timeframe == "1d"
+            assert since == target_ms
+            return [row]
+
+    monkeypatch.setitem(sys.modules, "ccxt", SimpleNamespace(gate=FakeGate))
+
+    candle = fetch_closed_candle(
+        "gate",
+        "BTC/USDT",
+        "1d",
+        target.isoformat(),
+    )
+
+    assert candle is not None
+    assert candle["timestamp"] == target.isoformat()
+    assert candle["open"] == pytest.approx(200.0)
+    assert candle["high"] == pytest.approx(207.0)
+    assert candle["low"] == pytest.approx(198.0)
+    assert candle["close"] == pytest.approx(205.5)
+    assert candle["volume"] == pytest.approx(615.0)
+
+
+def test_legacy_daily_verification_still_aggregates_old_24h_window(monkeypatch):
+    # Old natural-day records opened at Beijing 00:00 == previous-day 16:00 UTC.
     target = pd.Timestamp("2026-10-22T16:00:00Z")
     target_ms = int(target.timestamp() * 1000)
     four_hours_ms = 4 * 60 * 60 * 1000

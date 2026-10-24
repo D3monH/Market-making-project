@@ -14,11 +14,14 @@ bars: 5000
 results_dir: results/forecast
 
 # Forecast clock policy.
-# - Intraday candles keep exchange-native boundaries.
-# - 1d candles are rebuilt as natural Beijing days: 00:00 -> next-day 00:00.
-# - Dashboard timestamps are shown in Beijing time so the base/target window is explicit.
+# - All new forecasts use exchange-native candle boundaries.
+# - Gate native 1d candles use UTC 00:00 -> next UTC 00:00.
+# - Dashboard timestamps are shown in Asia/Shanghai, so Gate 1d appears as
+#   Beijing 08:00 -> next-day 08:00.
+# - `daily_candle_timezone` is kept as UTC for backward-compatible UI/config
+#   labels; data.py no longer rebuilds new daily candles from 4h data.
 time:
-  daily_candle_timezone: Asia/Shanghai
+  daily_candle_timezone: UTC
   display_timezone: Asia/Shanghai
 
 forecast:

@@ -20,9 +20,10 @@ This repository is an experimental crypto quantitative-research platform. Read `
    - target candle: 20:15 -> 20:30
    - target to verify: 20:30 close
 4. One exchange + symbol + timeframe + base candle may create only one persistent forecast. Re-clicking must not rewrite/cherry-pick the prediction.
-5. 1d forecasting uses the natural `Asia/Shanghai` day (00:00 -> next-day 00:00), rebuilt from closed 4h candles. Do not silently switch back to Gate/UTC native daily candles.
-6. Verification happens only after the complete target candle has closed.
-7. Realized model/alpha scores must come only from settled out-of-sample predictions.
+5. New Gate 1d forecasts use Gate's exchange-native daily candle. Its boundary is UTC 00:00 -> next UTC 00:00, which displays as Beijing 08:00 -> next-day 08:00 in `Asia/Shanghai`. Do not rebuild new Gate daily forecasts as Beijing 00:00 -> 24:00.
+6. Legacy records with `natural_day:Asia/Shanghai` are historical compatibility cohorts only. They may still be settled using the legacy 4h aggregation path, but must never be mixed with the new Gate-native daily cohort.
+7. Verification happens only after the complete target candle has closed.
+8. Realized model/alpha scores must come only from settled out-of-sample predictions.
 
 ## Market-data constraints
 
@@ -30,6 +31,7 @@ This repository is an experimental crypto quantitative-research platform. Read `
 - Gate spot candlesticks reject excessively old `since/from` windows. The data layer contains a venue-aware history cap and safety margin. Do not bypass it by calling CCXT OHLCV directly from Streamlit pages.
 - A requested bar count is a preferred target. If a venue cannot supply that much history, use the maximum recent valid window and let the model's minimum-row checks decide whether training is possible.
 - Do not reintroduce the old bug where pagination stops as soon as `bars` rows are collected before reaching current closed candles.
+- `resample_daily_ohlcv()` exists for legacy-data compatibility; it is not the source for new Gate 1d forecasts.
 
 ## Current major components
 

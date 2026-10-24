@@ -15,7 +15,12 @@ from quant_mm.dashboard_utils import (
     load_forecast_history,
     save_forecast_run,
 )
-from quant_mm.data import fetch_closed_candle, fetch_forecast_ohlcv, fetch_last_price
+from quant_mm.data import (
+    fetch_closed_candle,
+    fetch_forecast_ohlcv,
+    fetch_last_price,
+    forecast_candle_basis,
+)
 from quant_mm.forecast_engine import ForecastConfig, forecast_next_candle
 from quant_mm.forecast_store import accuracy_summary, settle_due_forecasts, store_status
 from quant_mm.model_performance import model_performance_table, realized_model_weights
@@ -84,14 +89,6 @@ def regime_cn(regime: str) -> str:
     }.get(regime, regime)
 
 
-def candle_basis_for(timeframe: str, daily_timezone: str) -> str:
-    return (
-        f"natural_day:{daily_timezone}"
-        if timeframe == "1d"
-        else "exchange_native_closed"
-    )
-
-
 def result_table(results: list[dict], display_timezone: str) -> pd.DataFrame:
     rows = []
     for row in results:
@@ -141,7 +138,11 @@ def run_forecasts(
                 bars,
                 daily_timezone,
             )
-            candle_basis = candle_basis_for(timeframe, daily_timezone)
+            candle_basis = forecast_candle_basis(
+                exchange,
+                timeframe,
+                daily_timezone,
+            )
             live_weights = realized_model_weights(
                 results_dir,
                 symbol=symbol,
@@ -191,6 +192,7 @@ def format_history(
         else "-"
     )
     out["周期"] = out.get("timeframe")
+    out["K线口径"] = out.get("candle_basis", pd.Series(index=out.index, dtype=str)).fillna("-")
     out["趋势"] = out.get("trend", pd.Series(index=out.index, dtype=str)).map(trend_cn)
     out["预期收益%"] = pd.to_numeric(out.get("expected_return_pct"), errors="coerce")
     out["基准收盘时间"] = out.apply(
@@ -218,6 +220,7 @@ def format_history(
     columns = [
         "预测时间",
         "周期",
+        "K线口径",
         "状态",
         "基准收盘时间",
         "目标收盘时间",
@@ -245,7 +248,7 @@ st.caption(
 config = load_config()
 results_dir = config.get("results_dir", "results/forecast")
 time_cfg = config.get("time", {}) or {}
-daily_timezone = str(time_cfg.get("daily_candle_timezone", "Asia/Shanghai"))
+daily_timezone = str(time_cfg.get("daily_candle_timezone", "UTC"))
 display_timezone = str(time_cfg.get("display_timezone", "Asia/Shanghai"))
 base_forecast_cfg = config.get("forecast", {}) or {}
 
@@ -292,10 +295,17 @@ with st.sidebar:
         help="每个周期独立训练；预测的是下一根该周期 K 线的收盘价。",
     )
 
-    st.caption(
-        f"时间显示：`{display_timezone}`\n\n"
-        f"1d 边界：`{daily_timezone}` 自然日 00:00 → 次日 00:00"
-    )
+    if exchange == "gate":
+        st.caption(
+            f"时间显示：`{display_timezone}`\n\n"
+            "Gate 1d：交易所原生日 K（UTC 00:00→次日 00:00），"
+            "北京时间显示为 **08:00→次日 08:00**。"
+        )
+    else:
+        st.caption(
+            f"时间显示：`{display_timezone}`\n\n"
+            "1d 使用交易所原生日 K。"
+        )
 
     display_mode = st.selectbox(
         "结果重点",
@@ -310,7 +320,7 @@ with st.sidebar:
             max_value=10000,
             value=int(config.get("bars", 5000)),
             step=500,
-            help="1d 会用 4h K 重采样成北京时间自然日，因此首次下载可能更慢。",
+            help="使用交易所能够提供的最近已收盘 K 线；超出数据源历史范围时会自动缩到可用窗口。",
         )
     )
 
@@ -482,9 +492,13 @@ else:
                 f"**{target_close_text} 收盘价**。实时价不会改变这条预测。"
             )
             if row["timeframe"] == "1d":
-                st.caption(
-                    f"1d 使用 `{daily_timezone}` 自然日：00:00 开盘 → 次日 00:00 收盘。"
-                )
+                if current_exchange == "gate":
+                    st.caption(
+                        "Gate 1d 使用交易所原生日 K：UTC 00:00→次日 00:00；"
+                        "当前页面按北京时间显示，因此每天 **08:00 收盘**。"
+                    )
+                else:
+                    st.caption("1d 使用当前交易所原生日 K。")
 
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("趋势", trend_cn(row["trend"]))
@@ -631,6 +645,7 @@ def verification_panel() -> None:
             columns={
                 "symbol": "币种",
                 "timeframe": "周期",
+                "candle_basis": "K线口径",
                 "settled_count": "已验真次数",
                 "directional_signal_count": "有效多空信号数",
             }
@@ -641,6 +656,7 @@ def verification_panel() -> None:
                 [
                     "币种",
                     "周期",
+                    "K线口径",
                     "已验真次数",
                     "方向命中率",
                     "有效多空信号数",
@@ -661,7 +677,11 @@ def verification_panel() -> None:
                 leaderboard_timeframes,
                 key="model_leaderboard_timeframe",
             )
-            leaderboard_basis = candle_basis_for(leaderboard_tf, daily_timezone)
+            leaderboard_basis = forecast_candle_basis(
+                st.session_state.forecast_exchange or exchange,
+                leaderboard_tf,
+                daily_timezone,
+            )
             leaderboard = model_performance_table(
                 results_dir,
                 symbol=summary_symbol,
