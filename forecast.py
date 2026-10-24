@@ -12,11 +12,11 @@ from quant_mm.dashboard_utils import (
 )
 from quant_mm.data import (
     fetch_closed_candle,
-    fetch_forecast_ohlcv,
     forecast_candle_basis,
 )
 from quant_mm.forecast_engine import ForecastConfig, forecast_next_candle
 from quant_mm.forecast_store import settle_due_forecasts, store_status
+from quant_mm.market_cache import load_cached_forecast_ohlcv
 from quant_mm.model_performance import realized_model_weights
 
 
@@ -30,6 +30,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--config", default="config_forecast.yaml")
     p.add_argument("--symbol", action="append", help="e.g. --symbol BTC/USDT")
     p.add_argument("--timeframe", action="append", help="e.g. --timeframe 15m --timeframe 1h")
+    p.add_argument("--no-cache", action="store_true", help="disable persistent local OHLCV cache for this run")
     return p.parse_args()
 
 
@@ -46,6 +47,9 @@ def main() -> None:
     time_cfg = cfg.get("time", {}) or {}
     daily_timezone = str(time_cfg.get("daily_candle_timezone", "UTC"))
     display_timezone = str(time_cfg.get("display_timezone", "Asia/Shanghai"))
+    market_data_cfg = cfg.get("market_data", {}) or {}
+    use_cache = bool(market_data_cfg.get("use_cache", True)) and not args.no_cache
+    cache_dir = str(market_data_cfg.get("cache_dir", "data/cache/ohlcv"))
 
     settlement = settle_due_forecasts(
         results_dir,
@@ -64,6 +68,11 @@ def main() -> None:
     print("Crypto Multi-Horizon Forecast Engine - research only")
     print("Models: Linear + Ridge + HistGradientBoosting + ElasticNet + ExtraTrees + Logistic direction")
     print(f"Display timezone: {display_timezone}")
+    print(f"OHLCV cache: {'enabled' if use_cache else 'disabled'} ({cache_dir})")
+    if forecast_cfg.recency_half_life_bars > 0:
+        print(f"Recency weighting half-life: {forecast_cfg.recency_half_life_bars:.0f} bars")
+    if forecast_cfg.manual_model_multipliers:
+        print(f"Manual model multipliers: {forecast_cfg.manual_model_multipliers}")
     if str(exchange).lower() in {"gate", "gateio"}:
         print("Gate 1d boundary: native UTC day; displayed in Beijing as 08:00 -> next-day 08:00")
     else:
@@ -74,11 +83,13 @@ def main() -> None:
         print(f"\n[{symbol}]")
         for timeframe in timeframes:
             try:
-                data = fetch_forecast_ohlcv(
+                data = load_cached_forecast_ohlcv(
                     exchange,
                     symbol,
                     timeframe,
                     bars,
+                    cache_dir=cache_dir,
+                    use_cache=use_cache,
                     daily_timezone=daily_timezone,
                 )
                 candle_basis = forecast_candle_basis(
@@ -128,6 +139,12 @@ def main() -> None:
                 print(
                     f"        base close={base_close_text} -> target close={target_close_text} "
                     f"range=[{result.lower_price:.4f}, {result.upper_price:.4f}]"
+                )
+                print(
+                    f"        cache={data.attrs.get('cache_refresh_mode', '-')} "
+                    f"local={data.attrs.get('cache_rows_total', len(data))} "
+                    f"downloaded={data.attrs.get('downloaded_rows_this_run', 0)} "
+                    f"missing={data.attrs.get('missing_intervals', 0)}"
                 )
             except Exception as exc:
                 print(f"  {timeframe:>4}  ERROR: {exc}")
