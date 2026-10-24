@@ -13,6 +13,7 @@ from quant_mm.dashboard_utils import (
 from quant_mm.data import fetch_closed_candle, fetch_forecast_ohlcv
 from quant_mm.forecast_engine import ForecastConfig, forecast_next_candle
 from quant_mm.forecast_store import settle_due_forecasts, store_status
+from quant_mm.model_performance import realized_model_weights
 
 
 def load_config(path: str) -> dict:
@@ -26,6 +27,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--symbol", action="append", help="e.g. --symbol BTC/USDT")
     p.add_argument("--timeframe", action="append", help="e.g. --timeframe 15m --timeframe 1h")
     return p.parse_args()
+
+
+def candle_basis_for(timeframe: str, daily_timezone: str) -> str:
+    return (
+        f"natural_day:{daily_timezone}"
+        if timeframe == "1d"
+        else "exchange_native_closed"
+    )
 
 
 def main() -> None:
@@ -55,12 +64,12 @@ def main() -> None:
 
     run_id = datetime.now(timezone.utc).isoformat()
     all_results: list[dict] = []
-    print("=" * 88)
+    print("=" * 96)
     print("Crypto Multi-Horizon Forecast Engine - research only")
-    print("Models: LinearRegression + Ridge + HistGradientBoosting + LogisticRegression")
+    print("Models: Linear + Ridge + HistGradientBoosting + ElasticNet + ExtraTrees + Logistic direction")
     print(f"Display timezone: {display_timezone}")
     print(f"1d candle boundary: natural day in {daily_timezone}")
-    print("=" * 88)
+    print("=" * 96)
 
     for symbol in symbols:
         print(f"\n[{symbol}]")
@@ -73,14 +82,26 @@ def main() -> None:
                     bars,
                     daily_timezone=daily_timezone,
                 )
-                result = forecast_next_candle(data, timeframe=timeframe, cfg=forecast_cfg)
+                candle_basis = candle_basis_for(timeframe, daily_timezone)
+                live_weights = realized_model_weights(
+                    results_dir,
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    candle_basis=candle_basis,
+                    min_samples=forecast_cfg.realized_weight_min_samples,
+                )
+                result = forecast_next_candle(
+                    data,
+                    timeframe=timeframe,
+                    cfg=forecast_cfg,
+                    realized_model_weights=live_weights,
+                )
                 row = result.to_dict()
                 row["symbol"] = symbol
                 row["exchange"] = exchange
                 row["forecast_run_at"] = run_id
-                row["candle_basis"] = (
-                    f"natural_day:{daily_timezone}" if timeframe == "1d" else "exchange_native_closed"
-                )
+                row["candle_basis"] = candle_basis
+                row["realized_model_weights"] = live_weights
                 all_results.append(row)
 
                 window = forecast_window(result.as_of, timeframe)
@@ -92,13 +113,14 @@ def main() -> None:
                 )
 
                 print(
-                    f"  {timeframe:>4}  trend={result.trend:<11} "
-                    f"signal={result.research_signal:<10} "
+                    f"  {timeframe:>4}  regime={result.market_regime:<10} "
+                    f"trend={result.trend:<11} signal={result.research_signal:<10} "
                     f"E[r]={result.expected_return_pct:+.3f}%  "
-                    f"P(up)={result.up_probability:.1%}  "
-                    f"conf={result.confidence:.1%}  "
-                    f"base={result.current_price:.4f}  "
-                    f"target={result.expected_price:.4f}"
+                    f"P(up)={result.up_probability:.1%}  conf={result.confidence:.1%}"
+                )
+                print(
+                    f"        base={result.current_price:.4f} -> target={result.expected_price:.4f}  "
+                    f"weights={result.weighting_mode}"
                 )
                 print(
                     f"        base close={base_close_text} -> target close={target_close_text} "
