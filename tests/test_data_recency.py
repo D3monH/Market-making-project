@@ -8,6 +8,10 @@ import pandas as pd
 from quant_mm.data import _initial_since_ms, fetch_ohlcv
 
 
+class FakeNetworkError(Exception):
+    pass
+
+
 def test_initial_since_keeps_small_history_buffer():
     now_ms = 10_000_000
     timeframe_ms = 60_000
@@ -50,7 +54,11 @@ def test_fetch_ohlcv_paginates_to_latest_closed_candle(monkeypatch):
             eligible = [row for row in rows if row[0] >= since]
             return eligible[:5]
 
-    monkeypatch.setitem(sys.modules, "ccxt", SimpleNamespace(gate=FakeGate))
+    monkeypatch.setitem(
+        sys.modules,
+        "ccxt",
+        SimpleNamespace(gate=FakeGate, NetworkError=FakeNetworkError),
+    )
 
     result = fetch_ohlcv("gate", "BTC/USDT", "1m", bars=20)
 

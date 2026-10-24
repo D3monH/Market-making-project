@@ -207,6 +207,33 @@ The returned DataFrame contains metadata in `df.attrs`:
 
 Do not bypass the centralized data layer from Streamlit pages.
 
+### 4.1 Gate public API timeout resilience
+
+Observed failure mode on Windows/CCXT:
+
+```text
+ccxt.base.errors.RequestTimeout
+gate GET https://api.gateio.ws/api/v4/spot/currencies
+```
+
+CCXT `load_markets()` fetches currencies when `has['fetchCurrencies']` is enabled. The forecasting and Institutional Alpha research paths do not require Gate currency/deposit-withdraw metadata, only market-pair metadata plus public ticker/OHLCV data.
+
+Current policy in `quant_mm/data.py`:
+
+```text
+Gate research instance
+  -> timeout = 20 seconds
+  -> set has['fetchCurrencies'] = False
+  -> load market pairs
+  -> retry transient CCXT NetworkError / RequestTimeout up to 3 attempts
+```
+
+The same bounded retry helper is used by public ticker and OHLCV requests. Parameter, validation and exchange business errors are not retried as network failures.
+
+Institutional Alpha catches exhausted market-data network failures and renders a concise Streamlit error instead of exposing a full traceback. If the run fails before a forecast is successfully built, no new forecast/alpha record is persisted.
+
+Do not re-enable Gate `fetchCurrencies` on the forecasting data path unless a feature actually requires currency metadata and the timeout behavior is covered by tests.
+
 ## 5. Data integrity protections already implemented
 
 - Gate legacy exchange id `gateio` normalizes to CCXT `gate`.
@@ -217,6 +244,7 @@ Do not bypass the centralized data layer from Streamlit pages.
 - New Gate 1d forecast basis is `gate_native_utc_day` at the data-policy layer.
 - Dashboard/config compatibility may expose UTC as the daily timezone label; with `Asia/Shanghai` display this yields 08:00 daily close times.
 - Legacy `natural_day:Asia/Shanghai` records remain historical compatibility data and must stay separate from new daily statistics.
+- Transient public API timeouts are retried centrally; routine timeout failures should not crash the Streamlit research UI.
 
 ## 6. Current databases
 
@@ -271,6 +299,7 @@ Important regression files:
 
 - `tests/test_data_recency.py`
 - `tests/test_gate_history_limit.py`
+- `tests/test_gate_timeout_resilience.py`
 - `tests/test_forecast.py`
 - `tests/test_forecast_time_alignment.py`
 - `tests/test_forecast_store.py`
@@ -285,11 +314,16 @@ Do not merge changes to data/time/persistence semantics without a test that demo
 ### P0 - stability / observability
 
 - Surface requested vs effective history bars in both Streamlit pages.
-- Show explicit candle-basis label in Dashboard/Institutional Alpha (`Gate native UTC day`, not only a timezone string).
-- Add data-source health panel: last closed timestamp, returned rows, venue cap, stale status.
+- Add data-source health panel: last closed timestamp, returned rows, venue cap, stale status, retry/last-error status.
 - Add migration/version number to SQLite metadata.
-- Add structured error categories instead of raw tracebacks in UI.
-- Add `candle_basis` to Alpha persistence so old/new daily alpha cohorts can be separated exactly like forecast cohorts.
+- Extend structured UI errors to the main dashboard and background monitor where useful.
+
+Completed P0 items that should not regress:
+
+- Explicit candle-basis labels in Dashboard/Institutional Alpha.
+- Alpha `candle_basis` persistence so old/new daily cohorts remain separated.
+- Gate public API currency-skip + bounded timeout retry policy.
+- Institutional Alpha no longer exposes routine market-data timeout tracebacks.
 
 ### P1 - historical derivatives data aligned to candles
 
