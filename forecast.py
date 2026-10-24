@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 
 import yaml
@@ -23,10 +24,6 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def safe_name(value: str) -> str:
-    return value.replace("/", "_").replace(":", "_")
-
-
 def main() -> None:
     args = parse_args()
     cfg = load_config(args.config)
@@ -37,6 +34,7 @@ def main() -> None:
     bars = int(cfg.get("bars", 5000))
     forecast_cfg = ForecastConfig(**cfg.get("forecast", {}))
 
+    run_id = datetime.now(timezone.utc).isoformat()
     all_results: list[dict] = []
     print("=" * 88)
     print("Crypto Multi-Horizon Forecast Engine V0.3 - research only")
@@ -52,6 +50,7 @@ def main() -> None:
                 row = result.to_dict()
                 row["symbol"] = symbol
                 row["exchange"] = exchange
+                row["forecast_run_at"] = run_id
                 all_results.append(row)
 
                 print(
@@ -68,11 +67,18 @@ def main() -> None:
 
     out_dir = Path(cfg.get("results_dir", "results/forecast"))
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / "latest_forecast.json"
-    with open(out_path, "w", encoding="utf-8") as f:
+
+    latest_path = out_dir / "latest_forecast.json"
+    with open(latest_path, "w", encoding="utf-8") as f:
         json.dump(all_results, f, ensure_ascii=False, indent=2)
 
-    print(f"\nSaved: {out_path}")
+    history_path = out_dir / "forecast_history.jsonl"
+    with open(history_path, "a", encoding="utf-8") as f:
+        for row in all_results:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+    print(f"\nSaved latest:  {latest_path}")
+    print(f"Saved history: {history_path}")
     print("Note: forecast output is probabilistic research information, not guaranteed future price.")
 
 
