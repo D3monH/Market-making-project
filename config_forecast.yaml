@@ -29,3 +29,13 @@ forecast:
   strong_threshold_bps: 25.0
   min_signal_confidence: 0.52
   random_state: 42
+
+  # Model ensemble.
+  # Baseline: Linear + Ridge + HistGradientBoosting.
+  # Advanced adds ElasticNet + ExtraTrees.
+  use_advanced_models: true
+
+  # Once enough real settled forecasts exist for a symbol/timeframe, blend
+  # out-of-sample realized model performance with current validation weights.
+  realized_weight_blend: 0.65
+  realized_weight_min_samples: 30
