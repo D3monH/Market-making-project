@@ -1,0 +1,53 @@
+symbol: BTC/USDT
+
+gate:
+  ws_url: wss://api.gateio.ws/ws/v4/
+
+market_maker:
+  order_notional_usdt: 50.0
+  max_inventory_usdt: 1000.0
+  base_half_spread_bps: 3.0
+  min_half_spread_bps: 1.5
+  vol_spread_multiplier: 0.20
+  signal_weight: 0.70
+  max_signal_bps: 12.0
+  inventory_skew_bps: 10.0
+
+micro_alpha:
+  book_weight_bps: 3.0
+  trade_flow_weight_bps: 3.0
+  max_micro_signal_bps: 6.0
+  trade_window: 100
+
+online_linear:
+  horizon_ms: 5000
+  min_sample_interval_ms: 500
+  train_window: 2000
+  min_train_samples: 200
+  retrain_every: 20
+  max_abs_prediction_bps: 10.0
+
+paper:
+  initial_equity_usdt: 10000.0
+  initial_base_inventory_usdt: 500.0
+  target_inventory_ratio: 0.50
+  maker_fee_bps: 2.0
+  max_drawdown_pct: 0.15
+  max_daily_loss_pct: 0.03
+  min_quote_interval_ms: 500
+  strict_crossing_fill: true
+  allow_short: false
+  vol_window: 60
+
+execution:
+  mode: paper
+  account: spot
+  api_key_env: GATE_API_KEY
+  api_secret_env: GATE_API_SECRET
+  live_confirmation_env: ALLOW_GATE_LIVE_TRADING
+
+console:
+  snapshot_every_seconds: 5
+
+paths:
+  live_dir: data/live

@@ -6,5 +6,6 @@ venv/
 .idea/
 .vscode/
 data/cache/
+data/live/
 results/
 .env
