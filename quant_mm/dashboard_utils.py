@@ -24,16 +24,61 @@ def timeframe_to_timedelta(timeframe: str) -> pd.Timedelta:
     return pd.Timedelta(value, unit=mapping[unit])
 
 
+def utc_timestamp(value) -> pd.Timestamp:
+    ts = pd.Timestamp(value)
+    if ts.tzinfo is None:
+        return ts.tz_localize("UTC")
+    return ts.tz_convert("UTC")
+
+
+def to_display_timestamp(value, timezone_name: str = "Asia/Shanghai") -> pd.Timestamp:
+    """Convert a stored UTC timestamp into the configured display timezone."""
+    return utc_timestamp(value).tz_convert(timezone_name)
+
+
+def format_display_timestamp(
+    value,
+    timezone_name: str = "Asia/Shanghai",
+    include_seconds: bool = False,
+) -> str:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return "-"
+    ts = to_display_timestamp(value, timezone_name)
+    fmt = "%Y-%m-%d %H:%M:%S" if include_seconds else "%Y-%m-%d %H:%M"
+    return ts.strftime(fmt)
+
+
+def chart_in_display_timezone(
+    frame: pd.DataFrame,
+    timezone_name: str = "Asia/Shanghai",
+) -> pd.DataFrame:
+    """Render chart x-axis as timezone-local wall-clock values.
+
+    Streamlit/browser timezone handling can otherwise make the same timestamp
+    appear differently on machines in different zones. We convert to the chosen
+    timezone first and then remove tz metadata so the chart displays that wall
+    clock literally.
+    """
+    if frame.empty:
+        return frame.copy()
+    out = frame.copy()
+    index = pd.DatetimeIndex(out.index)
+    if index.tz is None:
+        index = index.tz_localize("UTC")
+    else:
+        index = index.tz_convert("UTC")
+    out.index = index.tz_convert(timezone_name).tz_localize(None)
+    return out
+
+
 def forecast_window(as_of, timeframe: str) -> dict[str, pd.Timestamp]:
     """Return the base and target candle boundaries for a one-candle forecast.
 
-    CCXT OHLCV timestamps are candle OPEN times. For example, if a 15m
-    forecast has `as_of=20:00`, the model's base price is the close at 20:15,
-    and the target is the next candle close at 20:30.
+    OHLCV indexes represent candle OPEN times. If a 15m forecast has
+    `as_of=20:00`, its base candle closes at 20:15 and the next target candle
+    closes at 20:30.
     """
-    base_open = pd.Timestamp(as_of)
-    if base_open.tzinfo is None:
-        base_open = base_open.tz_localize("UTC")
+    base_open = utc_timestamp(as_of)
     delta = timeframe_to_timedelta(timeframe)
     base_close = base_open + delta
     target_open = base_close

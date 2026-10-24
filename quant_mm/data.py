@@ -6,6 +6,8 @@ import time
 import pandas as pd
 
 COLUMNS = ["timestamp", "open", "high", "low", "close", "volume"]
+DEFAULT_FORECAST_DAY_TIMEZONE = "Asia/Shanghai"
+FORECAST_DAILY_BASE_TIMEFRAME = "4h"
 
 EXCHANGE_ALIASES = {
     # CCXT renamed/standardized Gate's exchange id to `gate`.
@@ -58,6 +60,15 @@ def _utc_timestamp(value) -> pd.Timestamp:
     return ts
 
 
+def _timeframe_delta(timeframe: str) -> pd.Timedelta:
+    value = str(timeframe).strip().lower()
+    if not value or value[-1] not in {"m", "h", "d", "w"}:
+        raise ValueError(f"Unsupported timeframe: {timeframe}")
+    number = int(value[:-1])
+    unit = {"m": "min", "h": "h", "d": "D", "w": "W"}[value[-1]]
+    return pd.Timedelta(number, unit=unit)
+
+
 def load_csv(path: str | Path) -> pd.DataFrame:
     df = pd.read_csv(path)
     missing = set(COLUMNS) - set(df.columns)
@@ -87,26 +98,156 @@ def fetch_last_price(exchange_id: str, symbol: str) -> float:
     return float(price)
 
 
+def resample_daily_ohlcv(
+    base: pd.DataFrame,
+    timezone_name: str = DEFAULT_FORECAST_DAY_TIMEZONE,
+    base_timeframe: str = FORECAST_DAILY_BASE_TIMEFRAME,
+    now=None,
+) -> pd.DataFrame:
+    """Build closed natural-day crypto candles in a chosen timezone.
+
+    For the default Asia/Shanghai timezone, each output candle represents
+    Beijing 00:00 -> next-day 00:00. The returned index remains the candle OPEN
+    timestamp in UTC so the rest of the forecast pipeline keeps one consistent
+    timestamp convention.
+
+    The function requires a complete set of base candles for the day. With the
+    default 4h base timeframe that means exactly six 4h candles per day.
+    """
+    if base.empty:
+        return base.copy()
+
+    frame = base.copy().sort_index()
+    index = pd.DatetimeIndex(frame.index)
+    if index.tz is None:
+        index = index.tz_localize("UTC")
+    else:
+        index = index.tz_convert("UTC")
+    frame.index = index.tz_convert(timezone_name)
+
+    base_delta = _timeframe_delta(base_timeframe)
+    one_day = pd.Timedelta(days=1)
+    expected_parts_float = one_day / base_delta
+    expected_parts = int(expected_parts_float)
+    if expected_parts <= 0 or base_delta * expected_parts != one_day:
+        raise ValueError(f"Base timeframe {base_timeframe} must divide one day exactly")
+
+    grouped = frame.resample("1D", label="left", closed="left")
+    daily = grouped.agg(
+        {
+            "open": "first",
+            "high": "max",
+            "low": "min",
+            "close": "last",
+            "volume": "sum",
+        }
+    )
+    counts = grouped["close"].count()
+
+    now_ts = pd.Timestamp.now(tz="UTC") if now is None else _utc_timestamp(now)
+    now_local = now_ts.tz_convert(timezone_name)
+    complete_mask = (counts >= expected_parts) & ((daily.index + one_day) <= now_local)
+    daily = daily.loc[complete_mask].dropna(subset=["open", "high", "low", "close"])
+    daily.index = daily.index.tz_convert("UTC")
+    return daily
+
+
+def latest_candle_close_at(df: pd.DataFrame, timeframe: str) -> pd.Timestamp:
+    if df.empty:
+        raise ValueError("market data is empty")
+    last_open = _utc_timestamp(df.index[-1])
+    return last_open + _timeframe_delta(timeframe)
+
+
+def ensure_recent_closed_data(
+    df: pd.DataFrame,
+    timeframe: str,
+    now=None,
+    tolerance_ratio: float = 0.05,
+) -> None:
+    """Reject silently stale forecast inputs.
+
+    A valid latest closed candle may be almost one full timeframe old while the
+    next candle is still forming. Anything older than one timeframe plus a small
+    tolerance indicates pagination/alignment/data-source trouble and should not
+    be used for a new forecast.
+    """
+    close_at = latest_candle_close_at(df, timeframe)
+    now_ts = pd.Timestamp.now(tz="UTC") if now is None else _utc_timestamp(now)
+    delta = _timeframe_delta(timeframe)
+    tolerance = max(pd.Timedelta(minutes=2), delta * float(tolerance_ratio))
+
+    if close_at > now_ts + pd.Timedelta(minutes=2):
+        raise RuntimeError(
+            f"Latest candle closes in the future: close={close_at.isoformat()} now={now_ts.isoformat()}"
+        )
+    if now_ts - close_at > delta + tolerance:
+        raise RuntimeError(
+            "Latest closed candle is stale: "
+            f"timeframe={timeframe} close={close_at.isoformat()} now={now_ts.isoformat()}"
+        )
+
+
+def _aggregate_rows(rows: list[list], target_ms: int) -> dict:
+    if not rows:
+        raise ValueError("cannot aggregate empty OHLCV rows")
+    return {
+        "timestamp": pd.to_datetime(target_ms, unit="ms", utc=True).isoformat(),
+        "open": float(rows[0][1]),
+        "high": float(max(float(row[2]) for row in rows)),
+        "low": float(min(float(row[3]) for row in rows)),
+        "close": float(rows[-1][4]),
+        "volume": float(sum(float(row[5]) for row in rows)),
+    }
+
+
 def fetch_closed_candle(
     exchange_id: str,
     symbol: str,
     timeframe: str,
     candle_open_at,
 ) -> dict | None:
-    """Fetch one exact historical candle after it has fully closed.
+    """Fetch one exact historical forecast candle after it has fully closed.
 
     `candle_open_at` is the UTC open timestamp of the candle being verified.
-    Returns None while the candle is still forming or when the exchange has not
-    made that candle available yet.
+    For 1d forecasts we intentionally aggregate six exact 4h candles over the
+    stored 24-hour target window. This makes verification consistent with
+    Beijing-aligned (or any other exact 24-hour aligned) forecast days instead
+    of accidentally grading against the exchange's native UTC daily candle.
     """
     exchange, resolved_exchange_id = _create_exchange(exchange_id)
     if not exchange.has.get("fetchOHLCV"):
         raise ValueError(f"{resolved_exchange_id} does not support fetchOHLCV through CCXT")
 
-    timeframe_ms = int(exchange.parse_timeframe(timeframe) * 1000)
     target_ts = _utc_timestamp(candle_open_at)
     target_ms = int(target_ts.timestamp() * 1000)
     now_ms = int(exchange.milliseconds())
+
+    if timeframe.strip().lower() == "1d":
+        target_delta = pd.Timedelta(days=1)
+        target_close_ms = target_ms + int(target_delta.total_seconds() * 1000)
+        if target_close_ms > now_ms:
+            return None
+
+        base_timeframe = FORECAST_DAILY_BASE_TIMEFRAME
+        base_ms = int(exchange.parse_timeframe(base_timeframe) * 1000)
+        expected_parts = int(target_delta.total_seconds() * 1000) // base_ms
+        batch = exchange.fetch_ohlcv(
+            symbol,
+            timeframe=base_timeframe,
+            since=target_ms,
+            limit=expected_parts + 2,
+        )
+        expected_timestamps = {target_ms + i * base_ms for i in range(expected_parts)}
+        rows = [row for row in batch if int(row[0]) in expected_timestamps]
+        rows.sort(key=lambda row: int(row[0]))
+        if len(rows) != expected_parts:
+            return None
+        if any(int(row[0]) + base_ms > int(exchange.milliseconds()) for row in rows):
+            return None
+        return _aggregate_rows(rows, target_ms)
+
+    timeframe_ms = int(exchange.parse_timeframe(timeframe) * 1000)
     if target_ms + timeframe_ms > now_ms:
         return None
 
@@ -136,11 +277,11 @@ def fetch_closed_candle(
 
 
 def fetch_ohlcv(exchange_id: str, symbol: str, timeframe: str, bars: int) -> pd.DataFrame:
-    """Download the most recent *closed* OHLCV candles through CCXT.
+    """Download the most recent *exchange-native closed* OHLCV candles.
 
-    Important: the function paginates until it reaches the latest market data,
-    then keeps only the final `bars` closed candles. It must not stop merely
-    because `bars` rows were collected from an older buffered start point.
+    This low-level function preserves the venue's native candle boundaries. Use
+    `fetch_forecast_ohlcv` for forecasting, because forecast 1d candles have an
+    explicit natural-day timezone policy.
     """
     if bars <= 0:
         raise ValueError("bars must be greater than zero")
@@ -154,8 +295,6 @@ def fetch_ohlcv(exchange_id: str, symbol: str, timeframe: str, bars: int) -> pd.
     since = _initial_since_ms(now_ms, timeframe_ms, bars)
     rows: list[list] = []
 
-    # Request a reasonably large page, but do not assume every exchange will
-    # actually return that many rows. Some venues silently cap page sizes.
     request_limit = min(1000, max(1, bars))
     max_calls = max(20, min(500, bars // 25 + 30))
     calls = 0
@@ -178,13 +317,9 @@ def fetch_ohlcv(exchange_id: str, symbol: str, timeframe: str, bars: int) -> pd.
             break
         since = next_since
 
-        # If the exchange returned the currently-forming candle, we have
-        # reached real time. It will be removed by the closed-candle filter.
         if last_timestamp + timeframe_ms > now_ms:
             break
 
-        # Do NOT break just because len(batch) < request_limit. Several
-        # exchanges cap their response below the requested limit.
         time.sleep(exchange.rateLimit / 1000.0)
 
     if not rows:
@@ -193,13 +328,53 @@ def fetch_ohlcv(exchange_id: str, symbol: str, timeframe: str, bars: int) -> pd.
     df = pd.DataFrame(rows, columns=COLUMNS)
     df = df.drop_duplicates("timestamp").sort_values("timestamp")
 
-    # Re-read exchange time after pagination in case the download itself took a
-    # while. Only completed candles are allowed into model features.
     final_now_ms = int(exchange.milliseconds())
     df = df[df["timestamp"] + timeframe_ms <= final_now_ms]
     df = df.tail(bars)
     df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
     return df.set_index("timestamp")
+
+
+def fetch_forecast_ohlcv(
+    exchange_id: str,
+    symbol: str,
+    timeframe: str,
+    bars: int,
+    daily_timezone: str = DEFAULT_FORECAST_DAY_TIMEZONE,
+) -> pd.DataFrame:
+    """Return closed OHLCV with deterministic boundaries for forecasting.
+
+    Intraday timeframes use the exchange's native closed candles. A 1d forecast
+    is rebuilt from closed 4h candles so that the day is the natural day in
+    `daily_timezone` (Asia/Shanghai by default) rather than the exchange's UTC
+    day. The final dataset is rejected if its latest closed candle is stale.
+    """
+    normalized_tf = timeframe.strip().lower()
+    if normalized_tf != "1d":
+        frame = fetch_ohlcv(exchange_id, symbol, timeframe, bars)
+        ensure_recent_closed_data(frame, timeframe)
+        return frame
+
+    base_delta = _timeframe_delta(FORECAST_DAILY_BASE_TIMEFRAME)
+    parts_per_day = int(pd.Timedelta(days=1) / base_delta)
+    raw_bars = max(parts_per_day * int(bars) + parts_per_day * 3, 1000)
+    base = fetch_ohlcv(
+        exchange_id,
+        symbol,
+        FORECAST_DAILY_BASE_TIMEFRAME,
+        raw_bars,
+    )
+    daily = resample_daily_ohlcv(
+        base,
+        timezone_name=daily_timezone,
+        base_timeframe=FORECAST_DAILY_BASE_TIMEFRAME,
+    ).tail(bars)
+    if daily.empty:
+        raise RuntimeError(
+            f"No complete {daily_timezone} daily candles could be built for {symbol}"
+        )
+    ensure_recent_closed_data(daily, "1d")
+    return daily
 
 
 def cache_path(cache_dir: str | Path, exchange: str, symbol: str, timeframe: str) -> Path:

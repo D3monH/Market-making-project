@@ -50,6 +50,17 @@ def _forecast_id(row: dict) -> str:
     return hashlib.sha256(key.encode("utf-8")).hexdigest()[:32]
 
 
+def _ensure_column(
+    conn: sqlite3.Connection,
+    table: str,
+    column: str,
+    ddl: str,
+) -> None:
+    columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    if column not in columns:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
+
+
 def _deduplicate_existing_forecasts(conn: sqlite3.Connection) -> None:
     """Repair databases created before forecasts were keyed by base candle.
 
@@ -125,6 +136,7 @@ def _connect(results_dir: str | Path) -> sqlite3.Connection:
             validation_direction_accuracy REAL,
             model_predictions_json TEXT,
             model_weights_json TEXT,
+            candle_basis TEXT NOT NULL DEFAULT 'legacy_exchange_native',
             status TEXT NOT NULL DEFAULT 'PENDING',
             settled_at TEXT,
             actual_close REAL,
@@ -149,6 +161,13 @@ def _connect(results_dir: str | Path) -> sqlite3.Connection:
         """
     )
 
+    _ensure_column(
+        conn,
+        "forecasts",
+        "candle_basis",
+        "candle_basis TEXT NOT NULL DEFAULT 'legacy_exchange_native'",
+    )
+
     _deduplicate_existing_forecasts(conn)
     conn.execute(
         """
@@ -164,7 +183,7 @@ def _prepare_row(row: dict) -> dict:
     as_of = _utc_timestamp(row["as_of"])
     delta = _timeframe_delta(timeframe)
 
-    # CCXT candle timestamps are candle OPEN timestamps. If `as_of` is 20:00
+    # OHLCV candle timestamps are candle OPEN timestamps. If `as_of` is 20:00
     # for a 15m candle, its close is 20:15. We use that 20:15 close as the base
     # price and predict the next candle, which closes at 20:30.
     target_open = as_of + delta
@@ -175,6 +194,9 @@ def _prepare_row(row: dict) -> dict:
     prepared["as_of"] = as_of.isoformat()
     prepared["target_open_at"] = target_open.isoformat()
     prepared["target_close_at"] = target_close.isoformat()
+    prepared["candle_basis"] = str(
+        row.get("candle_basis") or "legacy_exchange_native"
+    )
     return prepared
 
 
@@ -193,8 +215,8 @@ def persist_forecasts(rows: Iterable[dict], results_dir: str | Path) -> int:
                     target_open_at, target_close_at, base_price, expected_return_pct,
                     expected_price, lower_price, upper_price, up_probability, confidence,
                     trend, research_signal, validation_direction_accuracy,
-                    model_predictions_json, model_weights_json, raw_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    model_predictions_json, model_weights_json, candle_basis, raw_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     row["forecast_id"],
@@ -217,6 +239,7 @@ def persist_forecasts(rows: Iterable[dict], results_dir: str | Path) -> int:
                     float(row.get("validation_direction_accuracy", 0.0)),
                     json.dumps(row.get("model_predictions_pct", {}), ensure_ascii=False),
                     json.dumps(row.get("model_weights", {}), ensure_ascii=False),
+                    row["candle_basis"],
                     json.dumps(row, ensure_ascii=False),
                 ),
             )
@@ -393,6 +416,7 @@ def accuracy_summary(results_dir: str | Path, symbol: str | None = None) -> pd.D
         SELECT
             symbol,
             timeframe,
+            candle_basis,
             COUNT(*) AS settled_count,
             AVG(direction_correct) AS direction_accuracy,
             AVG(CASE WHEN signal_correct IS NOT NULL THEN signal_correct END) AS signal_accuracy,
@@ -403,8 +427,8 @@ def accuracy_summary(results_dir: str | Path, symbol: str | None = None) -> pd.D
             AVG(confidence) AS avg_confidence
         FROM forecasts
         {where}
-        GROUP BY symbol, timeframe
-        ORDER BY symbol, timeframe
+        GROUP BY symbol, timeframe, candle_basis
+        ORDER BY symbol, timeframe, candle_basis
     """
     with _connect(results_dir) as conn:
         rows = conn.execute(sql, params).fetchall()

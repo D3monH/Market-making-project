@@ -9,10 +9,13 @@ import yaml
 
 from quant_mm.dashboard_utils import (
     build_price_projection,
+    chart_in_display_timezone,
+    forecast_window,
+    format_display_timestamp,
     load_forecast_history,
     save_forecast_run,
 )
-from quant_mm.data import fetch_closed_candle, fetch_ohlcv
+from quant_mm.data import fetch_closed_candle, fetch_forecast_ohlcv, fetch_last_price
 from quant_mm.forecast_engine import ForecastConfig, forecast_next_candle
 from quant_mm.forecast_store import accuracy_summary, settle_due_forecasts, store_status
 
@@ -21,8 +24,25 @@ CONFIG_PATH = Path("config_forecast.yaml")
 
 
 @st.cache_data(ttl=60, show_spinner=False)
-def load_market_data(exchange: str, symbol: str, timeframe: str, bars: int) -> pd.DataFrame:
-    return fetch_ohlcv(exchange, symbol, timeframe, bars)
+def load_market_data(
+    exchange: str,
+    symbol: str,
+    timeframe: str,
+    bars: int,
+    daily_timezone: str,
+) -> pd.DataFrame:
+    return fetch_forecast_ohlcv(
+        exchange,
+        symbol,
+        timeframe,
+        bars,
+        daily_timezone=daily_timezone,
+    )
+
+
+@st.cache_data(ttl=10, show_spinner=False)
+def load_live_price(exchange: str, symbol: str) -> float:
+    return fetch_last_price(exchange, symbol)
 
 
 def load_config() -> dict:
@@ -54,13 +74,20 @@ def signal_cn(signal: str) -> str:
     }.get(signal, signal)
 
 
-def result_table(results: list[dict]) -> pd.DataFrame:
+def result_table(results: list[dict], display_timezone: str) -> pd.DataFrame:
     rows = []
     for row in results:
+        window = forecast_window(row["as_of"], row["timeframe"])
         rows.append(
             {
                 "币种": row["symbol"],
                 "周期": row["timeframe"],
+                "基准收盘时间": format_display_timestamp(
+                    window["base_close_at"], display_timezone
+                ),
+                "目标收盘时间": format_display_timestamp(
+                    window["target_close_at"], display_timezone
+                ),
                 "趋势": trend_cn(row["trend"]),
                 "信号": signal_cn(row["research_signal"]),
                 "预期收益": fmt_pct(row["expected_return_pct"], 3),
@@ -79,6 +106,7 @@ def run_forecasts(
     bars: int,
     cfg: ForecastConfig,
     results_dir: str,
+    daily_timezone: str,
 ) -> tuple[list[dict], dict[str, pd.DataFrame], list[str]]:
     run_at = datetime.now(timezone.utc).isoformat()
     results: list[dict] = []
@@ -87,7 +115,13 @@ def run_forecasts(
 
     for timeframe in timeframes:
         try:
-            market = load_market_data(exchange, symbol, timeframe, bars)
+            market = load_market_data(
+                exchange,
+                symbol,
+                timeframe,
+                bars,
+                daily_timezone,
+            )
             forecast = forecast_next_candle(market, timeframe=timeframe, cfg=cfg)
             row = forecast.to_dict()
             row.update(
@@ -95,6 +129,11 @@ def run_forecasts(
                     "symbol": symbol,
                     "exchange": exchange,
                     "forecast_run_at": run_at,
+                    "candle_basis": (
+                        f"natural_day:{daily_timezone}"
+                        if timeframe == "1d"
+                        else "exchange_native_closed"
+                    ),
                 }
             )
             results.append(row)
@@ -107,29 +146,54 @@ def run_forecasts(
     return results, market_data, errors
 
 
-def format_history(history: pd.DataFrame) -> pd.DataFrame:
+def format_history(
+    history: pd.DataFrame,
+    display_timezone: str,
+) -> pd.DataFrame:
     if history.empty:
         return history
     out = history.copy()
     out["状态"] = out.get("status", pd.Series(index=out.index, dtype=str)).map(
         {"PENDING": "待收盘", "SETTLED": "已验真"}
     ).fillna("未知")
-    out["预测时间"] = out.get("forecast_run_at")
+    out["预测时间"] = out.get("forecast_run_at").map(
+        lambda value: format_display_timestamp(value, display_timezone, include_seconds=True)
+        if pd.notna(value)
+        else "-"
+    )
     out["周期"] = out.get("timeframe")
     out["趋势"] = out.get("trend", pd.Series(index=out.index, dtype=str)).map(trend_cn)
     out["预期收益%"] = pd.to_numeric(out.get("expected_return_pct"), errors="coerce")
-    out["目标收盘时间"] = out.get("target_close_at")
+    out["基准收盘时间"] = out.apply(
+        lambda row: format_display_timestamp(
+            forecast_window(row["as_of"], row["timeframe"])["base_close_at"],
+            display_timezone,
+        )
+        if pd.notna(row.get("as_of")) and pd.notna(row.get("timeframe"))
+        else "-",
+        axis=1,
+    )
+    out["目标收盘时间"] = out.get("target_close_at").map(
+        lambda value: format_display_timestamp(value, display_timezone)
+        if pd.notna(value)
+        else "-"
+    )
     out["实际收益%"] = pd.to_numeric(out.get("actual_return_pct"), errors="coerce")
-    out["方向命中"] = out.get("direction_correct").map({1.0: "✅", 0.0: "❌", 1: "✅", 0: "❌"})
+    out["方向命中"] = out.get("direction_correct").map(
+        {1.0: "✅", 0.0: "❌", 1: "✅", 0: "❌"}
+    )
     out["价格误差%"] = pd.to_numeric(out.get("price_abs_error_pct"), errors="coerce")
-    out["区间命中"] = out.get("interval_hit").map({1.0: "✅", 0.0: "❌", 1: "✅", 0: "❌"})
+    out["区间命中"] = out.get("interval_hit").map(
+        {1.0: "✅", 0.0: "❌", 1: "✅", 0: "❌"}
+    )
     columns = [
         "预测时间",
         "周期",
         "状态",
+        "基准收盘时间",
+        "目标收盘时间",
         "趋势",
         "预期收益%",
-        "目标收盘时间",
         "实际收益%",
         "方向命中",
         "价格误差%",
@@ -145,10 +209,15 @@ st.set_page_config(
 )
 
 st.title("Crypto 多周期预测仪表盘")
-st.caption("选择币种与周期，一键运行多模型预测。预测会持久化，并在目标 K 线收盘后自动验真。")
+st.caption(
+    "预测只使用已经完整收盘的 K 线。实时价仅用于页面参考，不会替代模型基准收盘价。"
+)
 
 config = load_config()
 results_dir = config.get("results_dir", "results/forecast")
+time_cfg = config.get("time", {}) or {}
+daily_timezone = str(time_cfg.get("daily_candle_timezone", "Asia/Shanghai"))
+display_timezone = str(time_cfg.get("display_timezone", "Asia/Shanghai"))
 
 with st.sidebar:
     st.header("预测设置")
@@ -157,23 +226,45 @@ with st.sidebar:
     default_exchange = config.get("exchange", "gate")
     if default_exchange == "gateio":
         default_exchange = "gate"
-    default_exchange_index = exchange_options.index(default_exchange) if default_exchange in exchange_options else 0
+    default_exchange_index = (
+        exchange_options.index(default_exchange) if default_exchange in exchange_options else 0
+    )
     exchange = st.selectbox("数据源交易所", exchange_options, index=default_exchange_index)
 
-    preset_symbols = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "DOGE/USDT", "XRP/USDT", "自定义"]
+    preset_symbols = [
+        "BTC/USDT",
+        "ETH/USDT",
+        "SOL/USDT",
+        "DOGE/USDT",
+        "XRP/USDT",
+        "自定义",
+    ]
     preset_symbol = st.selectbox("币种", preset_symbols, index=0)
     if preset_symbol == "自定义":
-        symbol = st.text_input("自定义交易对", value="BTC/USDT", placeholder="例如 ADA/USDT").strip().upper()
+        symbol = st.text_input(
+            "自定义交易对",
+            value="BTC/USDT",
+            placeholder="例如 ADA/USDT",
+        ).strip().upper()
     else:
         symbol = preset_symbol
 
     timeframe_options = ["5m", "15m", "30m", "1h", "4h", "12h", "1d"]
-    default_timeframes = [tf for tf in config.get("timeframes", ["15m", "1h", "4h", "1d"]) if tf in timeframe_options]
+    default_timeframes = [
+        tf
+        for tf in config.get("timeframes", ["15m", "1h", "4h", "1d"])
+        if tf in timeframe_options
+    ]
     timeframes = st.multiselect(
         "预测周期",
         timeframe_options,
         default=default_timeframes or ["15m", "1h"],
-        help="每个周期都会独立训练并预测下一根该周期 K 线。",
+        help="每个周期独立训练；预测的是下一根该周期 K 线的收盘价。",
+    )
+
+    st.caption(
+        f"时间显示：`{display_timezone}`\n\n"
+        f"1d 边界：`{daily_timezone}` 自然日 00:00 → 次日 00:00"
     )
 
     display_mode = st.selectbox(
@@ -189,7 +280,7 @@ with st.sidebar:
             max_value=10000,
             value=int(config.get("bars", 5000)),
             step=500,
-            help="更多历史数据可能更稳定，但首次运行会更慢。",
+            help="1d 会用 4h K 重采样成北京时间自然日，因此首次下载可能更慢。",
         )
     )
 
@@ -234,7 +325,7 @@ with st.sidebar:
 
     run_button = st.button("开始预测", type="primary", use_container_width=True)
     verify_button = st.button("立即验真到期预测", use_container_width=True)
-    st.caption("仪表盘打开时每 60 秒也会自动检查一次到期预测。")
+    st.caption("页面打开时每 60 秒自动检查一次已经到期的预测。")
 
 forecast_cfg = ForecastConfig(
     train_window=train_window,
@@ -242,7 +333,9 @@ forecast_cfg = ForecastConfig(
     validation_fraction=float(config.get("forecast", {}).get("validation_fraction", 0.20)),
     neutral_threshold_bps=neutral_threshold_bps,
     strong_threshold_bps=strong_threshold_bps,
-    min_signal_confidence=float(config.get("forecast", {}).get("min_signal_confidence", 0.52)),
+    min_signal_confidence=float(
+        config.get("forecast", {}).get("min_signal_confidence", 0.52)
+    ),
     random_state=int(config.get("forecast", {}).get("random_state", 42)),
 )
 
@@ -251,6 +344,7 @@ if "forecast_results" not in st.session_state:
     st.session_state.market_data = {}
     st.session_state.forecast_errors = []
     st.session_state.forecast_symbol = None
+    st.session_state.forecast_exchange = None
 
 if verify_button:
     with st.spinner("正在检查已经收盘的预测..."):
@@ -284,11 +378,13 @@ if run_button:
                 bars=bars,
                 cfg=forecast_cfg,
                 results_dir=results_dir,
+                daily_timezone=daily_timezone,
             )
         st.session_state.forecast_results = results
         st.session_state.market_data = market_data
         st.session_state.forecast_errors = errors
         st.session_state.forecast_symbol = symbol
+        st.session_state.forecast_exchange = exchange
 
 results = st.session_state.forecast_results
 market_data = st.session_state.market_data
@@ -303,12 +399,40 @@ if not results:
     st.info("从左侧选择币种和周期，然后点击“开始预测”。")
 else:
     current_symbol = st.session_state.forecast_symbol
+    current_exchange = st.session_state.forecast_exchange or exchange
     st.subheader(f"{current_symbol} 预测总览")
-    st.dataframe(result_table(results), use_container_width=True, hide_index=True)
+    st.dataframe(
+        result_table(results, display_timezone),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    try:
+        live_price = load_live_price(current_exchange, current_symbol)
+    except Exception:
+        live_price = None
 
     tabs = st.tabs([row["timeframe"] for row in results])
     for tab, row in zip(tabs, results):
         with tab:
+            window = forecast_window(row["as_of"], row["timeframe"])
+            base_close_text = format_display_timestamp(
+                window["base_close_at"], display_timezone
+            )
+            target_close_text = format_display_timestamp(
+                window["target_close_at"], display_timezone
+            )
+
+            st.info(
+                f"本次预测口径：使用 **{base_close_text} 已收盘价格** "
+                f"`{row['current_price']:,.4f}` 作为模型基准，预测 "
+                f"**{target_close_text} 收盘价**。实时价不会改变这条预测。"
+            )
+            if row["timeframe"] == "1d":
+                st.caption(
+                    f"1d 使用 `{daily_timezone}` 自然日：00:00 开盘 → 次日 00:00 收盘。"
+                )
+
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("趋势", trend_cn(row["trend"]))
             c2.metric("研究信号", signal_cn(row["research_signal"]))
@@ -316,14 +440,23 @@ else:
             c4.metric("上涨概率", f"{row['up_probability']:.1%}")
 
             c5, c6, c7, c8 = st.columns(4)
-            c5.metric("模型基准价", f"{row['current_price']:,.4f}")
+            c5.metric("上一根收盘 / 模型基准", f"{row['current_price']:,.4f}")
             c6.metric(
+                "交易所实时价（仅参考）",
+                f"{live_price:,.4f}" if live_price is not None else "获取失败",
+            )
+            c7.metric(
                 "预测下一根收盘",
                 f"{row['expected_price']:,.4f}",
                 delta=fmt_pct(row["expected_return_pct"], 3),
             )
-            c7.metric("置信度", f"{row['confidence']:.1%}")
-            c8.metric("历史方向准确率", f"{row['validation_direction_accuracy']:.1%}")
+            c8.metric("置信度", f"{row['confidence']:.1%}")
+
+            st.caption(
+                f"历史方向验证准确率：{row['validation_direction_accuracy']:.1%} ｜ "
+                f"模型一致度：{row['model_agreement']:.1%} ｜ "
+                f"训练样本：{row['training_rows']}"
+            )
 
             if display_mode in {"综合预测", "价格目标与区间"}:
                 st.markdown(
@@ -340,12 +473,19 @@ else:
                     timeframe=row["timeframe"],
                     history_points=240,
                 )
+                projection = chart_in_display_timezone(
+                    projection,
+                    display_timezone,
+                )
                 st.line_chart(
                     projection,
                     height=360,
-                    x_label="时间",
+                    x_label=f"时间（{display_timezone}）",
                     y_label="价格",
-                    alt=f"{current_symbol} {row['timeframe']} 历史收盘价与下一根预测收盘价",
+                    alt=(
+                        f"{current_symbol} {row['timeframe']} "
+                        "历史收盘价与下一根预测收盘价"
+                    ),
                 )
 
             if display_mode in {"综合预测", "模型细节"}:
@@ -370,14 +510,11 @@ else:
                         y_label="权重 %",
                         alt="模型组合权重",
                     )
-                st.caption(
-                    f"模型一致度：{row['model_agreement']:.1%} ｜ 训练样本：{row['training_rows']}"
-                )
 
 st.divider()
 st.subheader("预测持久化与自动验真")
 st.caption(
-    "每条预测都会保存到 SQLite。目标 K 线收盘后，系统会用该根 K 线真实收盘价验真。"
+    "每条预测都会保存到 SQLite。只有目标 K 线完整收盘后，才用该根 K 线真实收盘价验真。"
 )
 
 
@@ -397,8 +534,14 @@ def verification_panel() -> None:
     c4.metric("当前已到期未完成", status["due"])
 
     if status["next_target_close_at"]:
-        st.caption(f"下一条待验真的目标收盘时间（UTC）：{status['next_target_close_at']}")
-    st.caption(f"持久化数据库：`{status['db_path']}` ｜ 页面打开时每 60 秒自动检查")
+        next_close = format_display_timestamp(
+            status["next_target_close_at"],
+            display_timezone,
+        )
+        st.caption(f"下一条待验真的目标收盘时间：{next_close}（{display_timezone}）")
+    st.caption(
+        f"持久化数据库：`{status['db_path']}` ｜ 页面打开时每 60 秒自动检查"
+    )
 
     if verification["errors"]:
         with st.expander("最近验真警告"):
@@ -409,11 +552,21 @@ def verification_panel() -> None:
     summary = accuracy_summary(results_dir, symbol=summary_symbol)
     if not summary.empty:
         shown = summary.copy()
-        shown["方向命中率"] = shown["direction_accuracy"].map(lambda x: f"{x:.1%}" if pd.notna(x) else "-")
-        shown["有效信号命中率"] = shown["signal_accuracy"].map(lambda x: f"{x:.1%}" if pd.notna(x) else "-")
-        shown["平均价格误差"] = shown["price_mae_pct"].map(lambda x: f"{x:.3f}%" if pd.notna(x) else "-")
-        shown["收益预测 MAE"] = shown["return_mae_pct"].map(lambda x: f"{x:.3f}%" if pd.notna(x) else "-")
-        shown["预测区间命中率"] = shown["interval_hit_rate"].map(lambda x: f"{x:.1%}" if pd.notna(x) else "-")
+        shown["方向命中率"] = shown["direction_accuracy"].map(
+            lambda x: f"{x:.1%}" if pd.notna(x) else "-"
+        )
+        shown["有效信号命中率"] = shown["signal_accuracy"].map(
+            lambda x: f"{x:.1%}" if pd.notna(x) else "-"
+        )
+        shown["平均价格误差"] = shown["price_mae_pct"].map(
+            lambda x: f"{x:.3f}%" if pd.notna(x) else "-"
+        )
+        shown["收益预测 MAE"] = shown["return_mae_pct"].map(
+            lambda x: f"{x:.3f}%" if pd.notna(x) else "-"
+        )
+        shown["预测区间命中率"] = shown["interval_hit_rate"].map(
+            lambda x: f"{x:.1%}" if pd.notna(x) else "-"
+        )
         shown = shown.rename(
             columns={
                 "symbol": "币种",
@@ -458,7 +611,7 @@ def verification_panel() -> None:
     )
     filtered = history[history["symbol"] == history_symbol].copy()
     st.dataframe(
-        format_history(filtered.head(100)),
+        format_history(filtered.head(100), display_timezone),
         use_container_width=True,
         hide_index=True,
     )
