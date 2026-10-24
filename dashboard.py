@@ -18,6 +18,7 @@ from quant_mm.dashboard_utils import (
 from quant_mm.data import fetch_closed_candle, fetch_forecast_ohlcv, fetch_last_price
 from quant_mm.forecast_engine import ForecastConfig, forecast_next_candle
 from quant_mm.forecast_store import accuracy_summary, settle_due_forecasts, store_status
+from quant_mm.model_performance import model_performance_table, realized_model_weights
 
 
 CONFIG_PATH = Path("config_forecast.yaml")
@@ -74,6 +75,23 @@ def signal_cn(signal: str) -> str:
     }.get(signal, signal)
 
 
+def regime_cn(regime: str) -> str:
+    return {
+        "TREND_UP": "上涨趋势",
+        "TREND_DOWN": "下跌趋势",
+        "RANGE": "震荡",
+        "HIGH_VOL": "高波动",
+    }.get(regime, regime)
+
+
+def candle_basis_for(timeframe: str, daily_timezone: str) -> str:
+    return (
+        f"natural_day:{daily_timezone}"
+        if timeframe == "1d"
+        else "exchange_native_closed"
+    )
+
+
 def result_table(results: list[dict], display_timezone: str) -> pd.DataFrame:
     rows = []
     for row in results:
@@ -88,6 +106,7 @@ def result_table(results: list[dict], display_timezone: str) -> pd.DataFrame:
                 "目标收盘时间": format_display_timestamp(
                     window["target_close_at"], display_timezone
                 ),
+                "市场状态": regime_cn(row.get("market_regime", "")),
                 "趋势": trend_cn(row["trend"]),
                 "信号": signal_cn(row["research_signal"]),
                 "预期收益": fmt_pct(row["expected_return_pct"], 3),
@@ -122,18 +141,28 @@ def run_forecasts(
                 bars,
                 daily_timezone,
             )
-            forecast = forecast_next_candle(market, timeframe=timeframe, cfg=cfg)
+            candle_basis = candle_basis_for(timeframe, daily_timezone)
+            live_weights = realized_model_weights(
+                results_dir,
+                symbol=symbol,
+                timeframe=timeframe,
+                candle_basis=candle_basis,
+                min_samples=cfg.realized_weight_min_samples,
+            )
+            forecast = forecast_next_candle(
+                market,
+                timeframe=timeframe,
+                cfg=cfg,
+                realized_model_weights=live_weights,
+            )
             row = forecast.to_dict()
             row.update(
                 {
                     "symbol": symbol,
                     "exchange": exchange,
                     "forecast_run_at": run_at,
-                    "candle_basis": (
-                        f"natural_day:{daily_timezone}"
-                        if timeframe == "1d"
-                        else "exchange_native_closed"
-                    ),
+                    "candle_basis": candle_basis,
+                    "realized_model_weights": live_weights,
                 }
             )
             results.append(row)
@@ -210,7 +239,7 @@ st.set_page_config(
 
 st.title("Crypto 多周期预测仪表盘")
 st.caption(
-    "预测只使用已经完整收盘的 K 线。实时价仅用于页面参考，不会替代模型基准收盘价。"
+    "预测只使用已经完整收盘的 K 线。实时价仅用于页面参考；模型权重可结合真实样本外战绩动态调整。"
 )
 
 config = load_config()
@@ -218,6 +247,7 @@ results_dir = config.get("results_dir", "results/forecast")
 time_cfg = config.get("time", {}) or {}
 daily_timezone = str(time_cfg.get("daily_candle_timezone", "Asia/Shanghai"))
 display_timezone = str(time_cfg.get("display_timezone", "Asia/Shanghai"))
+base_forecast_cfg = config.get("forecast", {}) or {}
 
 with st.sidebar:
     st.header("预测设置")
@@ -285,7 +315,6 @@ with st.sidebar:
     )
 
     with st.expander("高级模型参数"):
-        base_forecast_cfg = config.get("forecast", {})
         train_window = int(
             st.number_input(
                 "训练窗口",
@@ -322,6 +351,29 @@ with st.sidebar:
                 step=1.0,
             )
         )
+        use_advanced_models = st.checkbox(
+            "启用高级模型（ElasticNet + ExtraTrees）",
+            value=bool(base_forecast_cfg.get("use_advanced_models", True)),
+        )
+        realized_weight_blend = float(
+            st.slider(
+                "真实战绩权重占比",
+                min_value=0.0,
+                max_value=0.90,
+                value=float(base_forecast_cfg.get("realized_weight_blend", 0.65)),
+                step=0.05,
+                help="达到最少验真样本后，真实战绩会与当前验证集权重混合。",
+            )
+        )
+        realized_weight_min_samples = int(
+            st.number_input(
+                "真实战绩最少样本",
+                min_value=10,
+                max_value=500,
+                value=int(base_forecast_cfg.get("realized_weight_min_samples", 30)),
+                step=10,
+            )
+        )
 
     run_button = st.button("开始预测", type="primary", use_container_width=True)
     verify_button = st.button("立即验真到期预测", use_container_width=True)
@@ -330,13 +382,14 @@ with st.sidebar:
 forecast_cfg = ForecastConfig(
     train_window=train_window,
     min_train_rows=min_train_rows,
-    validation_fraction=float(config.get("forecast", {}).get("validation_fraction", 0.20)),
+    validation_fraction=float(base_forecast_cfg.get("validation_fraction", 0.20)),
     neutral_threshold_bps=neutral_threshold_bps,
     strong_threshold_bps=strong_threshold_bps,
-    min_signal_confidence=float(
-        config.get("forecast", {}).get("min_signal_confidence", 0.52)
-    ),
-    random_state=int(config.get("forecast", {}).get("random_state", 42)),
+    min_signal_confidence=float(base_forecast_cfg.get("min_signal_confidence", 0.52)),
+    random_state=int(base_forecast_cfg.get("random_state", 42)),
+    use_advanced_models=use_advanced_models,
+    realized_weight_blend=realized_weight_blend,
+    realized_weight_min_samples=realized_weight_min_samples,
 )
 
 if "forecast_results" not in st.session_state:
@@ -436,7 +489,7 @@ else:
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("趋势", trend_cn(row["trend"]))
             c2.metric("研究信号", signal_cn(row["research_signal"]))
-            c3.metric("预期收益", fmt_pct(row["expected_return_pct"], 3))
+            c3.metric("市场状态", regime_cn(row.get("market_regime", "")))
             c4.metric("上涨概率", f"{row['up_probability']:.1%}")
 
             c5, c6, c7, c8 = st.columns(4)
@@ -452,15 +505,21 @@ else:
             )
             c8.metric("置信度", f"{row['confidence']:.1%}")
 
+            weight_label = (
+                "验证集 + 真实战绩"
+                if row.get("weighting_mode") == "validation_plus_realized"
+                else "仅时间序列验证集"
+            )
             st.caption(
                 f"历史方向验证准确率：{row['validation_direction_accuracy']:.1%} ｜ "
                 f"模型一致度：{row['model_agreement']:.1%} ｜ "
-                f"训练样本：{row['training_rows']}"
+                f"权重来源：{weight_label} ｜ 训练样本：{row['training_rows']}"
             )
 
             if display_mode in {"综合预测", "价格目标与区间"}:
                 st.markdown(
-                    f"**预测区间：** `{row['lower_price']:,.4f}` ～ `{row['upper_price']:,.4f}`  "
+                    f"**预期收益：** `{fmt_pct(row['expected_return_pct'], 3)}`  "
+                    f"｜ **预测区间：** `{row['lower_price']:,.4f}` ～ `{row['upper_price']:,.4f}`  "
                     f"｜ **近期波动率：** `{row['realized_volatility_pct']:.3f}%`  "
                     f"｜ **验证 MAE：** `{row['validation_mae_pct']:.3f}%`"
                 )
@@ -489,14 +548,15 @@ else:
                 )
 
             if display_mode in {"综合预测", "模型细节"}:
-                st.markdown("#### 模型预测与权重")
+                st.markdown("#### 模型预测与最终权重")
                 model_rows = []
                 for model_name, pred_pct in row["model_predictions_pct"].items():
                     model_rows.append(
                         {
                             "模型": model_name,
                             "预测收益率(%)": pred_pct,
-                            "组合权重(%)": row["model_weights"].get(model_name, 0.0) * 100.0,
+                            "验证集权重(%)": row.get("validation_model_weights", {}).get(model_name, 0.0) * 100.0,
+                            "最终权重(%)": row["model_weights"].get(model_name, 0.0) * 100.0,
                         }
                     )
                 model_df = pd.DataFrame(model_rows)
@@ -505,16 +565,16 @@ else:
                     st.dataframe(model_df, use_container_width=True, hide_index=True)
                 with right:
                     st.bar_chart(
-                        model_df.set_index("模型")[["组合权重(%)"]],
+                        model_df.set_index("模型")[["最终权重(%)"]],
                         height=260,
                         y_label="权重 %",
                         alt="模型组合权重",
                     )
 
 st.divider()
-st.subheader("预测持久化与自动验真")
+st.subheader("预测持久化、自动验真与模型排行榜")
 st.caption(
-    "每条预测都会保存到 SQLite。只有目标 K 线完整收盘后，才用该根 K 线真实收盘价验真。"
+    "每条预测都会保存到 SQLite。目标 K 线完整收盘后才验真，并用真实结果分别评估每个模型。"
 )
 
 
@@ -594,6 +654,36 @@ def verification_panel() -> None:
             hide_index=True,
         )
 
+        leaderboard_timeframes = sorted(summary["timeframe"].dropna().unique().tolist())
+        if leaderboard_timeframes:
+            leaderboard_tf = st.selectbox(
+                "模型排行榜周期",
+                leaderboard_timeframes,
+                key="model_leaderboard_timeframe",
+            )
+            leaderboard_basis = candle_basis_for(leaderboard_tf, daily_timezone)
+            leaderboard = model_performance_table(
+                results_dir,
+                symbol=summary_symbol,
+                timeframe=leaderboard_tf,
+                candle_basis=leaderboard_basis,
+                limit=250,
+            )
+            if not leaderboard.empty:
+                board = leaderboard.copy()
+                board["方向命中率"] = board["direction_accuracy"].map(lambda x: f"{x:.1%}")
+                board["收益 MAE"] = board["mae_pct"].map(lambda x: f"{x:.3f}%")
+                board["真实战绩权重"] = board["realized_weight"].map(lambda x: f"{x:.1%}")
+                board = board.rename(columns={"model": "模型", "samples": "验真样本"})
+                st.markdown(f"#### {summary_symbol} / {leaderboard_tf} 模型真实战绩")
+                st.dataframe(
+                    board[["模型", "验真样本", "方向命中率", "收益 MAE", "真实战绩权重"]],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+            else:
+                st.caption("该周期还没有足够的模型级真实验真数据。")
+
     history = load_forecast_history(results_dir, limit=500)
     if history.empty:
         st.caption("还没有历史预测记录。")
@@ -620,5 +710,5 @@ def verification_panel() -> None:
 verification_panel()
 
 st.caption(
-    "研究用途：模型预测存在误差，历史表现不保证未来收益。长期统计应重点看样本外命中率、误差和不同市场状态下的稳定性。"
+    "研究用途：模型预测存在误差，历史表现不保证未来收益。长期统计应重点看样本外命中率、误差、市场状态和模型稳定性。"
 )
