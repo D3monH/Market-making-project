@@ -12,8 +12,9 @@ from quant_mm.dashboard_utils import (
     load_forecast_history,
     save_forecast_run,
 )
-from quant_mm.data import fetch_ohlcv
+from quant_mm.data import fetch_closed_candle, fetch_ohlcv
 from quant_mm.forecast_engine import ForecastConfig, forecast_next_candle
+from quant_mm.forecast_store import accuracy_summary, settle_due_forecasts, store_status
 
 
 CONFIG_PATH = Path("config_forecast.yaml")
@@ -106,6 +107,37 @@ def run_forecasts(
     return results, market_data, errors
 
 
+def format_history(history: pd.DataFrame) -> pd.DataFrame:
+    if history.empty:
+        return history
+    out = history.copy()
+    out["状态"] = out.get("status", pd.Series(index=out.index, dtype=str)).map(
+        {"PENDING": "待收盘", "SETTLED": "已验真"}
+    ).fillna("未知")
+    out["预测时间"] = out.get("forecast_run_at")
+    out["周期"] = out.get("timeframe")
+    out["趋势"] = out.get("trend", pd.Series(index=out.index, dtype=str)).map(trend_cn)
+    out["预期收益%"] = pd.to_numeric(out.get("expected_return_pct"), errors="coerce")
+    out["目标收盘时间"] = out.get("target_close_at")
+    out["实际收益%"] = pd.to_numeric(out.get("actual_return_pct"), errors="coerce")
+    out["方向命中"] = out.get("direction_correct").map({1.0: "✅", 0.0: "❌", 1: "✅", 0: "❌"})
+    out["价格误差%"] = pd.to_numeric(out.get("price_abs_error_pct"), errors="coerce")
+    out["区间命中"] = out.get("interval_hit").map({1.0: "✅", 0.0: "❌", 1: "✅", 0: "❌"})
+    columns = [
+        "预测时间",
+        "周期",
+        "状态",
+        "趋势",
+        "预期收益%",
+        "目标收盘时间",
+        "实际收益%",
+        "方向命中",
+        "价格误差%",
+        "区间命中",
+    ]
+    return out[columns]
+
+
 st.set_page_config(
     page_title="Crypto Forecast Dashboard",
     page_icon="📈",
@@ -113,7 +145,7 @@ st.set_page_config(
 )
 
 st.title("Crypto 多周期预测仪表盘")
-st.caption("选择币种与周期，一键运行多模型预测。当前只做研究预测，不会自动下单。")
+st.caption("选择币种与周期，一键运行多模型预测。预测会持久化，并在目标 K 线收盘后自动验真。")
 
 config = load_config()
 results_dir = config.get("results_dir", "results/forecast")
@@ -121,8 +153,10 @@ results_dir = config.get("results_dir", "results/forecast")
 with st.sidebar:
     st.header("预测设置")
 
-    exchange_options = ["gateio", "binance", "okx", "bybit"]
-    default_exchange = config.get("exchange", "gateio")
+    exchange_options = ["gate", "binance", "okx", "bybit"]
+    default_exchange = config.get("exchange", "gate")
+    if default_exchange == "gateio":
+        default_exchange = "gate"
     default_exchange_index = exchange_options.index(default_exchange) if default_exchange in exchange_options else 0
     exchange = st.selectbox("数据源交易所", exchange_options, index=default_exchange_index)
 
@@ -199,7 +233,8 @@ with st.sidebar:
         )
 
     run_button = st.button("开始预测", type="primary", use_container_width=True)
-    st.caption("提示：首次预测需要下载历史 K 线并训练模型。")
+    verify_button = st.button("立即验真到期预测", use_container_width=True)
+    st.caption("仪表盘打开时每 60 秒也会自动检查一次到期预测。")
 
 forecast_cfg = ForecastConfig(
     train_window=train_window,
@@ -216,6 +251,20 @@ if "forecast_results" not in st.session_state:
     st.session_state.market_data = {}
     st.session_state.forecast_errors = []
     st.session_state.forecast_symbol = None
+
+if verify_button:
+    with st.spinner("正在检查已经收盘的预测..."):
+        verification = settle_due_forecasts(
+            results_dir,
+            candle_fetcher=fetch_closed_candle,
+            limit=200,
+        )
+    if verification["settled"]:
+        st.sidebar.success(f"本次完成 {verification['settled']} 条验真")
+    elif verification["errors"]:
+        st.sidebar.warning("部分验真失败，请查看页面下方状态。")
+    else:
+        st.sidebar.info("当前没有新的到期预测。")
 
 if run_button:
     if not symbol:
@@ -267,7 +316,7 @@ else:
             c4.metric("上涨概率", f"{row['up_probability']:.1%}")
 
             c5, c6, c7, c8 = st.columns(4)
-            c5.metric("当前价", f"{row['current_price']:,.4f}")
+            c5.metric("模型基准价", f"{row['current_price']:,.4f}")
             c6.metric(
                 "预测下一根收盘",
                 f"{row['expected_price']:,.4f}",
@@ -325,34 +374,98 @@ else:
                     f"模型一致度：{row['model_agreement']:.1%} ｜ 训练样本：{row['training_rows']}"
                 )
 
-    st.divider()
-    st.subheader("历史预测记录")
-    history = load_forecast_history(results_dir, limit=300)
-    if history.empty:
-        st.caption("还没有历史记录。")
-    else:
-        available_symbols = history.get("symbol", pd.Series(dtype=str)).dropna().unique().tolist()
-        history_symbol = st.selectbox(
-            "查看历史币种",
-            available_symbols,
-            index=available_symbols.index(current_symbol) if current_symbol in available_symbols else 0,
-            key="history_symbol",
-        )
-        filtered = history[history["symbol"] == history_symbol].copy()
-        wanted = [
-            c
-            for c in [
-                "forecast_run_at",
-                "timeframe",
-                "trend",
-                "research_signal",
-                "expected_return_pct",
-                "up_probability",
-                "confidence",
-                "validation_direction_accuracy",
-            ]
-            if c in filtered.columns
-        ]
-        st.dataframe(filtered[wanted].tail(100), use_container_width=True, hide_index=True)
+st.divider()
+st.subheader("预测持久化与自动验真")
+st.caption(
+    "每条预测都会保存到 SQLite。目标 K 线收盘后，系统会用该根 K 线真实收盘价验真。"
+)
 
-st.caption("研究用途：模型预测存在误差，历史表现不保证未来收益。实盘接入前应先做长期 Paper/TestNet 验证。")
+
+@st.fragment(run_every="60s")
+def verification_panel() -> None:
+    verification = settle_due_forecasts(
+        results_dir,
+        candle_fetcher=fetch_closed_candle,
+        limit=50,
+    )
+    status = store_status(results_dir)
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("累计预测", status["total"])
+    c2.metric("等待收盘", status["pending"])
+    c3.metric("已验真", status["settled"])
+    c4.metric("当前已到期未完成", status["due"])
+
+    if status["next_target_close_at"]:
+        st.caption(f"下一条待验真的目标收盘时间（UTC）：{status['next_target_close_at']}")
+    st.caption(f"持久化数据库：`{status['db_path']}` ｜ 页面打开时每 60 秒自动检查")
+
+    if verification["errors"]:
+        with st.expander("最近验真警告"):
+            for error in verification["errors"]:
+                st.warning(error)
+
+    summary_symbol = st.session_state.forecast_symbol or symbol
+    summary = accuracy_summary(results_dir, symbol=summary_symbol)
+    if not summary.empty:
+        shown = summary.copy()
+        shown["方向命中率"] = shown["direction_accuracy"].map(lambda x: f"{x:.1%}" if pd.notna(x) else "-")
+        shown["有效信号命中率"] = shown["signal_accuracy"].map(lambda x: f"{x:.1%}" if pd.notna(x) else "-")
+        shown["平均价格误差"] = shown["price_mae_pct"].map(lambda x: f"{x:.3f}%" if pd.notna(x) else "-")
+        shown["收益预测 MAE"] = shown["return_mae_pct"].map(lambda x: f"{x:.3f}%" if pd.notna(x) else "-")
+        shown["预测区间命中率"] = shown["interval_hit_rate"].map(lambda x: f"{x:.1%}" if pd.notna(x) else "-")
+        shown = shown.rename(
+            columns={
+                "symbol": "币种",
+                "timeframe": "周期",
+                "settled_count": "已验真次数",
+                "directional_signal_count": "有效多空信号数",
+            }
+        )
+        st.markdown(f"#### {summary_symbol} 真实验真统计")
+        st.dataframe(
+            shown[
+                [
+                    "币种",
+                    "周期",
+                    "已验真次数",
+                    "方向命中率",
+                    "有效多空信号数",
+                    "有效信号命中率",
+                    "平均价格误差",
+                    "收益预测 MAE",
+                    "预测区间命中率",
+                ]
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    history = load_forecast_history(results_dir, limit=500)
+    if history.empty:
+        st.caption("还没有历史预测记录。")
+        return
+
+    available_symbols = history.get("symbol", pd.Series(dtype=str)).dropna().unique().tolist()
+    if not available_symbols:
+        return
+    selected = summary_symbol if summary_symbol in available_symbols else available_symbols[0]
+    history_symbol = st.selectbox(
+        "查看历史预测币种",
+        available_symbols,
+        index=available_symbols.index(selected),
+        key="verification_history_symbol",
+    )
+    filtered = history[history["symbol"] == history_symbol].copy()
+    st.dataframe(
+        format_history(filtered.head(100)),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+
+verification_panel()
+
+st.caption(
+    "研究用途：模型预测存在误差，历史表现不保证未来收益。长期统计应重点看样本外命中率、误差和不同市场状态下的稳定性。"
+)
