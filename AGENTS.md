@@ -29,9 +29,17 @@ This repository is an experimental crypto quantitative-research platform. Read `
 
 - All forecast market-data access should flow through `quant_mm/data.py`.
 - Gate spot candlesticks reject excessively old `since/from` windows. The data layer contains a venue-aware history cap and safety margin. Do not bypass it by calling CCXT OHLCV directly from Streamlit pages.
+- Gate public research instances intentionally set `exchange.has['fetchCurrencies'] = False` before `load_markets()`. The project only needs market-pair metadata for public ticker/OHLCV research, and `/spot/currencies` has caused avoidable startup timeouts. Do not re-enable it without a concrete requirement and regression coverage.
+- Public CCXT network requests use bounded retries for transient `NetworkError` / `RequestTimeout` failures. Do not retry exchange parameter/validation errors as if they were network failures.
 - A requested bar count is a preferred target. If a venue cannot supply that much history, use the maximum recent valid window and let the model's minimum-row checks decide whether training is possible.
 - Do not reintroduce the old bug where pagination stops as soon as `bars` rows are collected before reaching current closed candles.
 - `resample_daily_ohlcv()` exists for legacy-data compatibility; it is not the source for new Gate 1d forecasts.
+
+## UI error-handling constraints
+
+- Streamlit research pages should not expose a full traceback for routine market-data timeouts.
+- A failed network request must not persist a new formal forecast/alpha record.
+- Existing SQLite forecast/alpha history should remain readable even when current public APIs are temporarily unavailable.
 
 ## Current major components
 
@@ -60,6 +68,7 @@ When touching forecast time/data semantics, specifically review:
 - `tests/test_forecast_time_alignment.py`
 - `tests/test_forecast_store.py`
 - `tests/test_gate_history_limit.py`
+- `tests/test_gate_timeout_resilience.py`
 - `tests/test_institutional_alpha.py`
 - `tests/test_model_performance.py`
 
