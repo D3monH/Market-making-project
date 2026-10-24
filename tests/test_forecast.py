@@ -91,6 +91,28 @@ def test_realized_weights_are_blended_after_external_score_is_available():
     assert abs(sum(result.model_weights.values()) - 1.0) < 1e-9
 
 
+def test_recency_and_manual_weights_run_across_full_advanced_model_pool():
+    cfg = ForecastConfig(
+        min_train_rows=500,
+        train_window=1200,
+        use_advanced_models=True,
+        recency_half_life_bars=400,
+        manual_model_multipliers={
+            "linear": 0.8,
+            "ridge": 1.0,
+            "hist_gb": 1.1,
+            "elastic_net": 0.9,
+            "extra_trees": 1.4,
+        },
+    )
+    result = forecast_next_candle(synthetic_market(), "15m", cfg)
+
+    assert result.recency_half_life_bars == 400
+    assert result.weighting_mode == "validation_only_plus_manual"
+    assert result.manual_model_multipliers["extra_trees"] == 1.4
+    assert abs(sum(result.model_weights.values()) - 1.0) < 1e-9
+
+
 def test_positive_drift_does_not_produce_invalid_signal():
     cfg = ForecastConfig(min_train_rows=500, train_window=1200)
     result = forecast_next_candle(synthetic_market(drift=0.0012), "1h", cfg)
