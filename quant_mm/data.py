@@ -19,6 +19,36 @@ def normalize_exchange_id(exchange_id: str) -> str:
     return EXCHANGE_ALIASES.get(value, value)
 
 
+def _initial_since_ms(now_ms: int, timeframe_ms: int, bars: int) -> int:
+    """Start slightly before the requested window so gaps can be tolerated.
+
+    The caller must still paginate all the way to `now_ms`; the buffer is not a
+    reason to stop once `bars` rows have been collected.
+    """
+    return int(now_ms - bars * timeframe_ms * 1.10)
+
+
+def _create_exchange(exchange_id: str):
+    try:
+        import ccxt
+    except ImportError as exc:
+        raise RuntimeError(
+            "ccxt is required for market-data download: pip install -r requirements.txt"
+        ) from exc
+
+    requested_exchange_id = exchange_id
+    resolved_exchange_id = normalize_exchange_id(exchange_id)
+    exchange_cls = getattr(ccxt, resolved_exchange_id, None)
+    if exchange_cls is None:
+        raise ValueError(
+            f"Unknown CCXT exchange: {requested_exchange_id} (resolved as {resolved_exchange_id})"
+        )
+
+    exchange = exchange_cls({"enableRateLimit": True})
+    exchange.load_markets()
+    return exchange, resolved_exchange_id
+
+
 def load_csv(path: str | Path) -> pd.DataFrame:
     df = pd.read_csv(path)
     missing = set(COLUMNS) - set(df.columns)
@@ -28,53 +58,88 @@ def load_csv(path: str | Path) -> pd.DataFrame:
     return df[COLUMNS].drop_duplicates("timestamp").sort_values("timestamp").set_index("timestamp")
 
 
+def fetch_last_price(exchange_id: str, symbol: str) -> float:
+    """Return the exchange's latest public ticker price for display purposes."""
+    exchange, resolved_exchange_id = _create_exchange(exchange_id)
+    if not exchange.has.get("fetchTicker"):
+        raise ValueError(f"{resolved_exchange_id} does not support fetchTicker through CCXT")
+
+    ticker = exchange.fetch_ticker(symbol)
+    price = ticker.get("last")
+    if price is None:
+        price = ticker.get("close")
+    if price is None:
+        bid = ticker.get("bid")
+        ask = ticker.get("ask")
+        if bid is not None and ask is not None:
+            price = (float(bid) + float(ask)) / 2.0
+    if price is None:
+        raise RuntimeError(f"No latest ticker price returned for {symbol} on {resolved_exchange_id}")
+    return float(price)
+
+
 def fetch_ohlcv(exchange_id: str, symbol: str, timeframe: str, bars: int) -> pd.DataFrame:
-    """Download recent closed OHLCV candles through CCXT public market-data APIs."""
-    try:
-        import ccxt
-    except ImportError as exc:
-        raise RuntimeError(
-            "ccxt is required for market-data download: pip install -r requirements.txt"
-        ) from exc
+    """Download the most recent *closed* OHLCV candles through CCXT.
 
-    requested_exchange_id = exchange_id
-    exchange_id = normalize_exchange_id(exchange_id)
+    Important: the function paginates until it reaches the latest market data,
+    then keeps only the final `bars` closed candles. It must not stop merely
+    because `bars` rows were collected from an older buffered start point.
+    """
+    if bars <= 0:
+        raise ValueError("bars must be greater than zero")
 
-    exchange_cls = getattr(ccxt, exchange_id, None)
-    if exchange_cls is None:
-        raise ValueError(
-            f"Unknown CCXT exchange: {requested_exchange_id} (resolved as {exchange_id})"
-        )
-    exchange = exchange_cls({"enableRateLimit": True})
-    exchange.load_markets()
+    exchange, resolved_exchange_id = _create_exchange(exchange_id)
     if not exchange.has.get("fetchOHLCV"):
-        raise ValueError(f"{exchange_id} does not support fetchOHLCV through CCXT")
+        raise ValueError(f"{resolved_exchange_id} does not support fetchOHLCV through CCXT")
 
     timeframe_ms = int(exchange.parse_timeframe(timeframe) * 1000)
-    since = exchange.milliseconds() - int(bars * timeframe_ms * 1.10)
+    now_ms = int(exchange.milliseconds())
+    since = _initial_since_ms(now_ms, timeframe_ms, bars)
     rows: list[list] = []
 
-    while len(rows) < bars:
-        limit = min(1000, bars - len(rows))
-        batch = exchange.fetch_ohlcv(symbol, timeframe=timeframe, since=since, limit=limit)
+    # Request a reasonably large page, but do not assume every exchange will
+    # actually return that many rows. Some venues silently cap page sizes.
+    request_limit = min(1000, max(1, bars))
+    max_calls = max(20, min(500, bars // 25 + 30))
+    calls = 0
+
+    while since < now_ms and calls < max_calls:
+        calls += 1
+        batch = exchange.fetch_ohlcv(
+            symbol,
+            timeframe=timeframe,
+            since=since,
+            limit=request_limit,
+        )
         if not batch:
             break
+
         rows.extend(batch)
-        next_since = int(batch[-1][0]) + timeframe_ms
+        last_timestamp = int(batch[-1][0])
+        next_since = last_timestamp + timeframe_ms
         if next_since <= since:
             break
         since = next_since
-        if len(batch) < limit:
+
+        # If the exchange returned the currently-forming candle, we have
+        # reached real time. It will be removed by the closed-candle filter.
+        if last_timestamp + timeframe_ms > now_ms:
             break
+
+        # Do NOT break just because len(batch) < request_limit. Several
+        # exchanges cap their response below the requested limit.
         time.sleep(exchange.rateLimit / 1000.0)
 
     if not rows:
-        raise RuntimeError(f"No OHLCV returned for {symbol} on {exchange_id}")
+        raise RuntimeError(f"No OHLCV returned for {symbol} on {resolved_exchange_id}")
 
     df = pd.DataFrame(rows, columns=COLUMNS)
     df = df.drop_duplicates("timestamp").sort_values("timestamp")
-    now_ms = exchange.milliseconds()
-    df = df[df["timestamp"] + timeframe_ms <= now_ms]
+
+    # Re-read exchange time after pagination in case the download itself took a
+    # while. Only completed candles are allowed into model features.
+    final_now_ms = int(exchange.milliseconds())
+    df = df[df["timestamp"] + timeframe_ms <= final_now_ms]
     df = df.tail(bars)
     df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
     return df.set_index("timestamp")
