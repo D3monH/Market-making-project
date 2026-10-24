@@ -1,5 +1,15 @@
 # Changelog
 
+## 2026-10-24 - Gate public API timeout resilience
+
+- Fixed Institutional Alpha crashes caused by CCXT timing out on Gate `/spot/currencies` during `load_markets()`.
+- Gate public research instances now disable CCXT `fetchCurrencies` before market loading because currency metadata is not required for ticker/OHLCV forecasting.
+- Added a 20-second CCXT HTTP timeout and three-attempt retry policy for transient `NetworkError` / `RequestTimeout` failures.
+- Applied the same retry helper to public ticker and OHLCV requests instead of protecting initialization only.
+- Institutional Alpha now converts exhausted network retries into an in-page warning instead of a full Streamlit traceback.
+- Network failures do not persist a new formal prediction; existing SQLite history remains intact.
+- Added `tests/test_gate_timeout_resilience.py` so future CCXT/Codex changes preserve currency-skip and retry behavior.
+
 ## 2026-10-24 - Gate native daily boundary correction
 
 - Corrected new Gate `1d` forecasts to use the exchange-native daily candle instead of a custom Beijing 00:00 -> 24:00 reconstruction.
