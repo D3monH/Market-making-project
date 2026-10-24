@@ -17,7 +17,6 @@ from quant_mm.alpha_store import (
 from quant_mm.dashboard_utils import forecast_window, format_display_timestamp, save_forecast_run
 from quant_mm.data import (
     fetch_closed_candle,
-    fetch_forecast_ohlcv,
     fetch_last_price,
     forecast_candle_basis,
 )
@@ -27,6 +26,7 @@ from quant_mm.institutional_alpha import (
     build_institutional_alpha,
     fetch_gate_derivatives_context,
 )
+from quant_mm.market_cache import load_cached_forecast_ohlcv
 from quant_mm.model_performance import realized_model_weights
 
 CONFIG_PATH = Path("config_forecast.yaml")
@@ -77,19 +77,31 @@ def friendly_market_error(exc: Exception) -> str:
     if "network attempts" in lowered or "timeout" in lowered or "timed out" in lowered:
         return (
             "Gate 公共行情请求超时。程序已经自动重试，但当前网络仍未成功。"
-            "这不会影响已经保存的预测/验真记录；稍后再次点击即可。"
+            "如果本地缓存仍满足时效要求会自动回退使用；否则稍后再次点击即可。"
         )
+    if "stale" in lowered:
+        return "本地行情缓存已经过期且交易所刷新失败，已拒绝生成正式预测。请恢复网络后重试。"
     return f"行情/预测执行失败：{text}"
 
 
 @st.cache_data(ttl=60, show_spinner=False)
-def load_market(exchange: str, symbol: str, timeframe: str, bars: int, daily_timezone: str):
-    return fetch_forecast_ohlcv(
+def load_market(
+    exchange: str,
+    symbol: str,
+    timeframe: str,
+    bars: int,
+    daily_timezone: str,
+    use_cache: bool,
+    cache_dir: str,
+):
+    return load_cached_forecast_ohlcv(
         exchange,
         symbol,
         timeframe,
         bars,
         daily_timezone=daily_timezone,
+        use_cache=use_cache,
+        cache_dir=cache_dir,
     )
 
 
@@ -116,6 +128,8 @@ daily_timezone = str(time_cfg.get("daily_candle_timezone", "UTC"))
 display_timezone = str(time_cfg.get("display_timezone", "Asia/Shanghai"))
 forecast_raw = cfg.get("forecast", {}) or {}
 alpha_cfg = cfg.get("institutional_alpha", {}) or {}
+market_data_cfg = cfg.get("market_data", {}) or {}
+cache_dir = str(market_data_cfg.get("cache_dir", "data/cache/ohlcv"))
 
 with st.sidebar:
     st.header("机构 Alpha 设置")
@@ -133,9 +147,16 @@ with st.sidebar:
             max_value=10000,
             value=int(cfg.get("bars", 5000)),
             step=500,
-            help="使用交易所最近已收盘 K 线；超过数据源历史范围时会自动缩到可用窗口。",
+            help="训练使用最近窗口；本地缓存会长期增长，后续运行只增量同步。",
         )
     )
+    use_cache = st.checkbox(
+        "启用本地 K 线缓存",
+        value=bool(market_data_cfg.get("use_cache", True)),
+        help="第一次完整下载，后续只补最新 K 线。",
+    )
+    if use_cache:
+        st.caption(f"缓存目录：`{cache_dir}`")
     use_derivatives = st.checkbox(
         "启用 Gate 公共衍生品 Alpha",
         value=bool(alpha_cfg.get("use_gate_derivatives", True)),
@@ -161,7 +182,15 @@ if run:
     st.session_state.institutional_error = None
     try:
         with st.spinner(f"正在构建 {symbol} / {timeframe} 机构 Alpha..."):
-            market = load_market(exchange, symbol, timeframe, bars, daily_timezone)
+            market = load_market(
+                exchange,
+                symbol,
+                timeframe,
+                bars,
+                daily_timezone,
+                use_cache,
+                cache_dir,
+            )
             basis = forecast_candle_basis(exchange, timeframe, daily_timezone)
             realized = realized_model_weights(
                 results_dir,
@@ -248,6 +277,17 @@ else:
         st.caption(
             "Gate 原生 1d 按 UTC 日界线；当前页面显示北京时间，因此上一根/目标日线都在 **08:00** 收盘。"
         )
+
+    if market is not None:
+        st.caption(
+            f"数据缓存：{market.attrs.get('cache_refresh_mode', '-')} ｜ "
+            f"本地累计 {market.attrs.get('cache_rows_total', len(market))} 根 ｜ "
+            f"本次网络获取 {market.attrs.get('downloaded_rows_this_run', 0)} 根 ｜ "
+            f"缺口 {market.attrs.get('missing_intervals', 0)} ｜ "
+            f"`{market.attrs.get('cache_path', '-')}`"
+        )
+        if market.attrs.get("cache_refresh_mode") == "offline_cache":
+            st.warning("交易所刷新失败，本次使用仍满足时效要求的本地缓存。")
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("模型预测下一收盘", f"{row['expected_price']:,.4f}", delta=f"{row['expected_return_pct']:+.3f}%")
