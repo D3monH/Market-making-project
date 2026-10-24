@@ -1,5 +1,15 @@
 # Changelog
 
+## 2026-10-24 - Gate native daily boundary correction
+
+- Corrected new Gate `1d` forecasts to use the exchange-native daily candle instead of a custom Beijing 00:00 -> 24:00 reconstruction.
+- Gate daily boundaries are now treated as UTC 00:00 -> next UTC 00:00, displayed as Beijing 08:00 -> next-day 08:00.
+- `fetch_forecast_ohlcv()` now uses native `1d` directly; new daily forecasts no longer expand into six 4h source candles.
+- Native Gate daily verification now fetches the exact exchange `1d` candle.
+- Legacy `natural_day:Asia/Shanghai` records remain compatible: their non-UTC-midnight targets are still verified by the old exact 4h aggregation path.
+- Added explicit regression coverage for Beijing 08:00 daily close semantics and native-vs-legacy daily verification.
+- Updated `AGENTS.md`, `docs/DEVELOPMENT_STATUS.md`, `docs/FORECAST_TIME_SEMANTICS.md`, and `config_forecast.yaml` so Codex does not reintroduce the old 00:00 daily definition.
+
 ## 2026-10-24 - Gate history-limit stability hotfix
 
 - Fixed Gate `INVALID_PARAM_VALUE: Candlestick too long ago` failures affecting both the main forecast dashboard and Institutional Alpha page.
@@ -34,6 +44,7 @@
 - Rebuilt `1d` forecasts as natural `Asia/Shanghai` days from 4h candles.
 - Added stale-market-data rejection.
 - Added candle-basis versioning so legacy UTC/native daily records are not silently mixed with Beijing-natural daily records.
+- Note: the custom Beijing 00:00 daily definition introduced here was superseded later the same day by the Gate native daily boundary correction above.
 
 ## 2026-10-24 - Base-candle uniqueness and chart alignment (PR #8)
 
