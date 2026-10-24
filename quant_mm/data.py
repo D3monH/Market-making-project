@@ -2,12 +2,19 @@ from __future__ import annotations
 
 from pathlib import Path
 import time
+from typing import Callable, TypeVar
 
 import pandas as pd
 
 COLUMNS = ["timestamp", "open", "high", "low", "close", "volume"]
 DEFAULT_FORECAST_DAY_TIMEZONE = "Asia/Shanghai"
 FORECAST_DAILY_BASE_TIMEFRAME = "4h"
+
+EXCHANGE_HTTP_TIMEOUT_MS = 20_000
+EXCHANGE_NETWORK_RETRIES = 3
+EXCHANGE_RETRY_BACKOFF_SECONDS = 0.75
+
+T = TypeVar("T")
 
 EXCHANGE_ALIASES = {
     # CCXT renamed/standardized Gate's exchange id to `gate`.
@@ -74,6 +81,42 @@ def _initial_since_ms(
     return now_ms - int(requested_points * timeframe_ms)
 
 
+def _network_call(
+    operation: Callable[[], T],
+    *,
+    label: str,
+    retries: int = EXCHANGE_NETWORK_RETRIES,
+) -> T:
+    """Retry transient CCXT network failures with small linear backoff.
+
+    Only CCXT NetworkError subclasses (including RequestTimeout) are retried.
+    Exchange/parameter errors still fail immediately so programming mistakes are
+    not hidden behind repeated requests.
+    """
+    try:
+        import ccxt
+    except ImportError as exc:
+        raise RuntimeError(
+            "ccxt is required for market-data download: pip install -r requirements.txt"
+        ) from exc
+
+    network_error = ccxt.NetworkError
+    attempts = max(1, int(retries))
+    last_error: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return operation()
+        except network_error as exc:
+            last_error = exc
+            if attempt >= attempts:
+                break
+            time.sleep(EXCHANGE_RETRY_BACKOFF_SECONDS * attempt)
+
+    raise RuntimeError(
+        f"{label} failed after {attempts} network attempts: {last_error}"
+    ) from last_error
+
+
 def _create_exchange(exchange_id: str):
     try:
         import ccxt
@@ -90,8 +133,24 @@ def _create_exchange(exchange_id: str):
             f"Unknown CCXT exchange: {requested_exchange_id} (resolved as {resolved_exchange_id})"
         )
 
-    exchange = exchange_cls({"enableRateLimit": True})
-    exchange.load_markets()
+    exchange = exchange_cls(
+        {
+            "enableRateLimit": True,
+            "timeout": EXCHANGE_HTTP_TIMEOUT_MS,
+        }
+    )
+
+    # CCXT's load_markets() also calls fetch_currencies() when this capability is
+    # enabled. Gate's /spot/currencies payload is not required by this project's
+    # public ticker/OHLCV research path and can be slow or time out on some
+    # networks. Fetching market pairs is sufficient for symbol resolution.
+    if resolved_exchange_id == "gate" and isinstance(exchange.has, dict):
+        exchange.has["fetchCurrencies"] = False
+
+    _network_call(
+        exchange.load_markets,
+        label=f"{resolved_exchange_id} load_markets",
+    )
     return exchange, resolved_exchange_id
 
 
@@ -128,7 +187,10 @@ def fetch_last_price(exchange_id: str, symbol: str) -> float:
     if not exchange.has.get("fetchTicker"):
         raise ValueError(f"{resolved_exchange_id} does not support fetchTicker through CCXT")
 
-    ticker = exchange.fetch_ticker(symbol)
+    ticker = _network_call(
+        lambda: exchange.fetch_ticker(symbol),
+        label=f"{resolved_exchange_id} fetch_ticker {symbol}",
+    )
     price = ticker.get("last")
     if price is None:
         price = ticker.get("close")
@@ -250,11 +312,14 @@ def _fetch_legacy_natural_day_candle(
     base_timeframe = FORECAST_DAILY_BASE_TIMEFRAME
     base_ms = int(exchange.parse_timeframe(base_timeframe) * 1000)
     expected_parts = int(target_delta.total_seconds() * 1000) // base_ms
-    batch = exchange.fetch_ohlcv(
-        symbol,
-        timeframe=base_timeframe,
-        since=target_ms,
-        limit=expected_parts + 2,
+    batch = _network_call(
+        lambda: exchange.fetch_ohlcv(
+            symbol,
+            timeframe=base_timeframe,
+            since=target_ms,
+            limit=expected_parts + 2,
+        ),
+        label=f"{exchange.id} fetch_ohlcv {symbol} {base_timeframe}",
     )
     expected_timestamps = {target_ms + i * base_ms for i in range(expected_parts)}
     rows = [row for row in batch if int(row[0]) in expected_timestamps]
@@ -299,11 +364,14 @@ def fetch_closed_candle(
     if target_ms + timeframe_ms > now_ms:
         return None
 
-    batch = exchange.fetch_ohlcv(
-        symbol,
-        timeframe=timeframe,
-        since=target_ms,
-        limit=5,
+    batch = _network_call(
+        lambda: exchange.fetch_ohlcv(
+            symbol,
+            timeframe=timeframe,
+            since=target_ms,
+            limit=5,
+        ),
+        label=f"{resolved_exchange_id} fetch_ohlcv {symbol} {timeframe}",
     )
     if not batch:
         return None
@@ -362,11 +430,14 @@ def fetch_ohlcv(exchange_id: str, symbol: str, timeframe: str, bars: int) -> pd.
 
     while since < now_ms and calls < max_calls:
         calls += 1
-        batch = exchange.fetch_ohlcv(
-            symbol,
-            timeframe=timeframe,
-            since=since,
-            limit=request_limit,
+        batch = _network_call(
+            lambda: exchange.fetch_ohlcv(
+                symbol,
+                timeframe=timeframe,
+                since=since,
+                limit=request_limit,
+            ),
+            label=f"{resolved_exchange_id} fetch_ohlcv {symbol} {timeframe}",
         )
         if not batch:
             break
