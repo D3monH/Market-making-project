@@ -1,5 +1,20 @@
 # Changelog
 
+## 2026-10-25 - Persistent OHLCV cache and custom training weights
+
+- Added `quant_mm/market_cache.py` as the normal forecast/Alpha/CLI market-data working layer.
+- First run downloads the requested history window; later runs fetch only a small recent overlap, merge/deduplicate, and keep the local cache growing over time.
+- Default cache path: `data/cache/ohlcv/<exchange>/<symbol>/<timeframe>.csv`.
+- Added cache health metadata: refresh mode, total local rows, downloaded rows, missing intervals, last candle and cache path.
+- Added recent-cache fallback during temporary exchange outages while preserving the existing stale-data hard rejection.
+- Main Dashboard and Institutional Alpha now expose local cache status.
+- Added optional exponential recency sample weighting through `recency_half_life_bars`.
+- Added optional bounded manual model multipliers (0.25x..2.0x) layered after automatic validation/realized weights, followed by normalization.
+- Added Dashboard controls for cache, training window, recency half-life and per-model manual multipliers.
+- Forecast CLI now uses the persistent cache by default and supports `--no-cache`.
+- Added `tests/test_market_cache.py`, `tests/test_forecast_custom_weights.py`, and an end-to-end weighted advanced-model forecast test.
+- Updated `AGENTS.md`, `docs/DEVELOPMENT_STATUS.md`, and `config_forecast.yaml` for Codex handoff.
+
 ## 2026-10-24 - Gate public API timeout resilience
 
 - Fixed Institutional Alpha crashes caused by CCXT timing out on Gate `/spot/currencies` during `load_markets()`.
