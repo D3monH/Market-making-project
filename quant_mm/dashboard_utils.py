@@ -44,7 +44,7 @@ def build_price_projection(
 
 
 def save_forecast_run(rows: Iterable[dict], results_dir: str | Path) -> tuple[Path, Path]:
-    """Persist latest forecast, append JSONL history, and insert into SQLite verification store."""
+    """Persist latest forecast, append JSONL history, and insert verifiable rows into SQLite."""
     payload = list(rows)
     out_dir = Path(results_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -58,29 +58,46 @@ def save_forecast_run(rows: Iterable[dict], results_dir: str | Path) -> tuple[Pa
         for row in payload:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
-    persist_forecasts(payload, results_dir)
+    # Keep the original helper backward compatible with lightweight records
+    # used by tests/tools. Only complete real forecasts can be auto-verified.
+    required = {
+        "exchange",
+        "symbol",
+        "timeframe",
+        "forecast_run_at",
+        "as_of",
+        "current_price",
+        "expected_return_pct",
+        "expected_price",
+    }
+    verifiable = [row for row in payload if required.issubset(row)]
+    if verifiable:
+        persist_forecasts(verifiable, results_dir)
     return latest_path, history_path
 
 
 def load_forecast_history(results_dir: str | Path, limit: int = 300) -> pd.DataFrame:
     """Load persistent forecast records, including settlement results when available."""
     try:
-        return load_forecast_records(results_dir, limit=limit)
+        records = load_forecast_records(results_dir, limit=limit)
+        if not records.empty:
+            return records
     except Exception:
-        # Fallback keeps older installations readable even if the SQLite store
-        # cannot be opened for some reason.
-        path = Path(results_dir) / "forecast_history.jsonl"
-        if not path.exists():
-            return pd.DataFrame()
+        pass
 
-        rows: list[dict] = []
-        with path.open("r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rows.append(json.loads(line))
-                except json.JSONDecodeError:
-                    continue
-        return pd.DataFrame(rows[-max(1, int(limit)):])
+    # Fallback keeps older/lightweight history readable when no SQLite rows exist.
+    path = Path(results_dir) / "forecast_history.jsonl"
+    if not path.exists():
+        return pd.DataFrame()
+
+    rows: list[dict] = []
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return pd.DataFrame(rows[-max(1, int(limit)):])
