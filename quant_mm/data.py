@@ -7,6 +7,17 @@ import pandas as pd
 
 COLUMNS = ["timestamp", "open", "high", "low", "close", "volume"]
 
+EXCHANGE_ALIASES = {
+    # CCXT renamed/standardized Gate's exchange id to `gate`.
+    # Keep the legacy `gateio` value working for old config files and UI state.
+    "gateio": "gate",
+}
+
+
+def normalize_exchange_id(exchange_id: str) -> str:
+    value = str(exchange_id).strip().lower()
+    return EXCHANGE_ALIASES.get(value, value)
+
 
 def load_csv(path: str | Path) -> pd.DataFrame:
     df = pd.read_csv(path)
@@ -26,9 +37,14 @@ def fetch_ohlcv(exchange_id: str, symbol: str, timeframe: str, bars: int) -> pd.
             "ccxt is required for market-data download: pip install -r requirements.txt"
         ) from exc
 
+    requested_exchange_id = exchange_id
+    exchange_id = normalize_exchange_id(exchange_id)
+
     exchange_cls = getattr(ccxt, exchange_id, None)
     if exchange_cls is None:
-        raise ValueError(f"Unknown CCXT exchange: {exchange_id}")
+        raise ValueError(
+            f"Unknown CCXT exchange: {requested_exchange_id} (resolved as {exchange_id})"
+        )
     exchange = exchange_cls({"enableRateLimit": True})
     exchange.load_markets()
     if not exchange.has.get("fetchOHLCV"):
