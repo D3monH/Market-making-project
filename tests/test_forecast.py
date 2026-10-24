@@ -76,14 +76,18 @@ def test_realized_weights_are_blended_after_external_score_is_available():
         use_advanced_models=False,
         realized_weight_blend=0.70,
     )
+    realized = {"linear": 0.80, "ridge": 0.15, "hist_gb": 0.05}
     result = forecast_next_candle(
         synthetic_market(),
         "15m",
         cfg,
-        realized_model_weights={"linear": 0.80, "ridge": 0.15, "hist_gb": 0.05},
+        realized_model_weights=realized,
     )
     assert result.weighting_mode == "validation_plus_realized"
-    assert result.model_weights["linear"] > result.validation_model_weights["linear"]
+    for name, target_weight in realized.items():
+        assert abs(result.model_weights[name] - target_weight) < abs(
+            result.validation_model_weights[name] - target_weight
+        )
     assert abs(sum(result.model_weights.values()) - 1.0) < 1e-9
 
 
