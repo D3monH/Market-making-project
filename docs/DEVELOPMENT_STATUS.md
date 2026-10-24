@@ -139,56 +139,47 @@ OHLCV timestamps represent candle OPEN times.
 For a 15m forecast created at Beijing 20:29:
 
 ```text
-base candle:   20:00 -> 20:15
-base price:    20:15 close
-forecast target: 20:15 -> 20:30
-target value:  20:30 close
+base candle:      20:00 -> 20:15
+base price:       20:15 close
+forecast target:  20:15 -> 20:30
+target value:     20:30 close
 ```
 
 The live ticker is display/reference information only. It must never replace the model base close.
 
-### 1d policy
+### Gate 1d policy — current canonical definition
 
-`1d` means the natural `Asia/Shanghai` day:
+New Gate `1d` forecasts use the **exchange-native daily candle**.
+
+Gate's daily boundary is treated as:
 
 ```text
-00:00 Beijing -> next day 00:00 Beijing
+UTC 00:00 -> next UTC 00:00
 ```
 
-It is rebuilt from six closed 4h candles, rather than using the exchange-native UTC daily candle.
+The dashboard displays timestamps in `Asia/Shanghai` (UTC+8), therefore the same Gate candle is shown as:
 
-Training, prediction and verification must all use the same daily definition.
+```text
+Beijing 08:00 -> next-day Beijing 08:00
+```
+
+Example: if current Beijing time is 2026-10-24 20:00, the latest fully closed Gate daily candle closed at 2026-10-24 08:00 and the next target daily candle closes at 2026-10-25 08:00.
+
+Do **not** rebuild new Gate daily forecasts as Beijing 00:00 -> 24:00.
+
+### Legacy daily cohort
+
+Older releases created `natural_day:Asia/Shanghai` daily forecasts by aggregating six 4h candles from Beijing 00:00 -> 24:00.
+
+Those records are retained only for backward compatibility. `resample_daily_ohlcv()` and the legacy 4h verification path exist so already-persisted predictions can still be graded against the same definition they originally used.
+
+New and legacy daily cohorts must never be mixed when judging model performance.
 
 See `docs/FORECAST_TIME_SEMANTICS.md`.
 
-## 4. Gate OHLCV history-limit hotfix
+## 4. Gate OHLCV history-limit behavior
 
-### Symptom
-
-Selecting 5,000 historical K lines and forecasting `1d` caused both the main dashboard and Institutional Alpha page to fail with:
-
-```text
-INVALID_PARAM_VALUE
-Candlestick too long ago. Maximum 10000 points ago are allowed
-```
-
-### Root cause
-
-A Beijing-natural 1d candle is rebuilt from six 4h candles.
-
-Requesting 5,000 daily candles therefore asked for roughly:
-
-```text
-5000 * 6 + padding ~= 30,000 4h candles
-```
-
-The old `fetch_ohlcv()` also applied a 10% gap buffer, which pushed `since` even farther into the past.
-
-Gate rejects a candlestick request whose start time is too many interval-points in the past.
-
-### Fix
-
-`quant_mm/data.py` now contains a venue-aware maximum OHLCV lookback table.
+Gate can reject candlestick requests whose starting point is too many interval points in the past. `quant_mm/data.py` therefore contains a venue-aware history cap.
 
 For Gate:
 
@@ -198,9 +189,13 @@ safety margin:     100 points
 safe maximum:    9,900 points
 ```
 
-A huge requested history now degrades gracefully to the maximum recent valid source window. The function still paginates forward to the newest fully closed candles.
+Large requested histories degrade gracefully to the maximum recent valid window. Pagination still moves forward to the newest fully closed candle.
 
-For `1d`, a request for 5,000 days on Gate therefore produces the maximum number of complete Beijing-natural days that can be reconstructed from the available recent 4h history (roughly 1,600+ days, depending on boundaries/gaps), instead of throwing HTTP 400.
+### Important change after the daily-boundary correction
+
+New Gate `1d` forecasts now request native `1d` candles directly. They no longer require six 4h candles per day.
+
+Therefore a request for 5,000 daily candles no longer expands into ~30,000 source 4h candles. It asks for native daily data and is subject only to Gate's daily history availability / lookback cap.
 
 The returned DataFrame contains metadata in `df.attrs`:
 
@@ -208,9 +203,9 @@ The returned DataFrame contains metadata in `df.attrs`:
 - `returned_bars`
 - `venue_history_limit_points`
 - `history_limited`
-- for 1d: source timeframe/requested/returned bars
+- `candle_basis` on forecast frames
 
-Do not remove this protection unless the venue API behavior is re-verified.
+Do not bypass the centralized data layer from Streamlit pages.
 
 ## 5. Data integrity protections already implemented
 
@@ -219,8 +214,9 @@ Do not remove this protection unless the venue API behavior is re-verified.
 - Stale latest candles are rejected.
 - In-progress candles are excluded from forecast inputs.
 - Duplicate forecasts for the same target are prevented.
-- 1d daily-basis version is stored in persistence (`natural_day:Asia/Shanghai`).
-- Legacy records keep their old basis and are not silently mixed into new daily statistics.
+- New Gate 1d forecast basis is `gate_native_utc_day` at the data-policy layer.
+- Dashboard/config compatibility may expose UTC as the daily timezone label; with `Asia/Shanghai` display this yields 08:00 daily close times.
+- Legacy `natural_day:Asia/Shanghai` records remain historical compatibility data and must stay separate from new daily statistics.
 
 ## 6. Current databases
 
@@ -289,9 +285,11 @@ Do not merge changes to data/time/persistence semantics without a test that demo
 ### P0 - stability / observability
 
 - Surface requested vs effective history bars in both Streamlit pages.
+- Show explicit candle-basis label in Dashboard/Institutional Alpha (`Gate native UTC day`, not only a timezone string).
 - Add data-source health panel: last closed timestamp, returned rows, venue cap, stale status.
 - Add migration/version number to SQLite metadata.
 - Add structured error categories instead of raw tracebacks in UI.
+- Add `candle_basis` to Alpha persistence so old/new daily alpha cohorts can be separated exactly like forecast cohorts.
 
 ### P1 - historical derivatives data aligned to candles
 
