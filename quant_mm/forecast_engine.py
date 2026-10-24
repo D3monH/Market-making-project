@@ -5,8 +5,8 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import HistGradientBoostingRegressor
-from sklearn.linear_model import LinearRegression, LogisticRegression, Ridge
+from sklearn.ensemble import ExtraTreesRegressor, HistGradientBoostingRegressor
+from sklearn.linear_model import ElasticNet, LinearRegression, LogisticRegression, Ridge
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
@@ -28,6 +28,8 @@ class ForecastConfig:
     strong_threshold_bps: float = 25.0
     min_signal_confidence: float = 0.52
     random_state: int = 42
+    use_advanced_models: bool = True
+    realized_weight_blend: float = 0.65
 
 
 @dataclass(frozen=True)
@@ -43,12 +45,15 @@ class ForecastResult:
     confidence: float
     trend: str
     research_signal: str
+    market_regime: str
     realized_volatility_pct: float
     validation_mae_pct: float
     validation_direction_accuracy: float
     model_agreement: float
     model_predictions_pct: dict[str, float]
     model_weights: dict[str, float]
+    validation_model_weights: dict[str, float]
+    weighting_mode: str
     training_rows: int
 
     def to_dict(self) -> dict[str, Any]:
@@ -63,14 +68,13 @@ def _rsi(close: pd.Series, period: int = 14) -> pd.Series:
     avg_loss = loss.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
     rs = avg_gain / avg_loss.replace(0.0, np.nan)
     rsi = 100.0 - 100.0 / (1.0 + rs)
-    # A sustained one-sided market is valid data, not a missing-value condition.
     rsi = rsi.mask((avg_loss == 0.0) & (avg_gain > 0.0), 100.0)
     rsi = rsi.mask((avg_loss == 0.0) & (avg_gain == 0.0), 50.0)
     return rsi
 
 
 def build_forecast_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Build causal features plus the next native candle's close-return target."""
+    """Build causal features plus the next candle's close-return target."""
     out = df.copy().sort_index()
     close = out["close"].astype(float)
     open_ = out["open"].astype(float)
@@ -104,8 +108,8 @@ def build_forecast_features(df: pd.DataFrame) -> pd.DataFrame:
     return out.replace([np.inf, -np.inf], np.nan)
 
 
-def _regression_models(random_state: int):
-    return {
+def _regression_models(random_state: int, use_advanced_models: bool = True):
+    models = {
         "linear": make_pipeline(StandardScaler(), LinearRegression()),
         "ridge": make_pipeline(StandardScaler(), Ridge(alpha=3.0)),
         "hist_gb": HistGradientBoostingRegressor(
@@ -116,6 +120,77 @@ def _regression_models(random_state: int):
             random_state=random_state,
         ),
     }
+    if use_advanced_models:
+        models.update(
+            {
+                "elastic_net": make_pipeline(
+                    StandardScaler(),
+                    ElasticNet(
+                        alpha=1e-5,
+                        l1_ratio=0.20,
+                        max_iter=5000,
+                        random_state=random_state,
+                    ),
+                ),
+                "extra_trees": ExtraTreesRegressor(
+                    n_estimators=180,
+                    max_depth=9,
+                    min_samples_leaf=8,
+                    max_features=0.85,
+                    n_jobs=-1,
+                    random_state=random_state,
+                ),
+            }
+        )
+    return models
+
+
+def _normalize_weights(values: dict[str, float], model_names: list[str]) -> dict[str, float]:
+    clean = {name: max(0.0, float(values.get(name, 0.0))) for name in model_names}
+    total = sum(clean.values())
+    if total <= 0.0:
+        equal = 1.0 / max(1, len(model_names))
+        return {name: equal for name in model_names}
+    return {name: value / total for name, value in clean.items()}
+
+
+def _blend_weights(
+    validation_weights: dict[str, float],
+    realized_weights: dict[str, float] | None,
+    blend: float,
+) -> tuple[dict[str, float], str]:
+    names = list(validation_weights)
+    validation = _normalize_weights(validation_weights, names)
+    if not realized_weights:
+        return validation, "validation_only"
+
+    realized = _normalize_weights(realized_weights, names)
+    realized_coverage = sum(1 for name in names if float(realized_weights.get(name, 0.0)) > 0.0)
+    if realized_coverage < 2:
+        return validation, "validation_only"
+
+    alpha = float(np.clip(blend, 0.0, 0.90))
+    mixed = {
+        name: (1.0 - alpha) * validation[name] + alpha * realized[name]
+        for name in names
+    }
+    return _normalize_weights(mixed, names), "validation_plus_realized"
+
+
+def _market_regime(latest: pd.Series) -> str:
+    vol_16 = max(float(latest.get("vol_16", 0.0)), 1e-9)
+    vol_48 = max(float(latest.get("vol_48", vol_16)), 1e-9)
+    ret_16 = float(latest.get("ret_16", 0.0))
+    volatility_ratio = vol_16 / vol_48
+    trend_strength = abs(ret_16) / max(vol_16 * 4.0, 1e-9)
+
+    if volatility_ratio >= 1.45:
+        return "HIGH_VOL"
+    if trend_strength >= 0.85 and ret_16 > 0.0:
+        return "TREND_UP"
+    if trend_strength >= 0.85 and ret_16 < 0.0:
+        return "TREND_DOWN"
+    return "RANGE"
 
 
 def _classify_trend(expected_bps: float, up_probability: float, cfg: ForecastConfig) -> str:
@@ -144,8 +219,9 @@ def forecast_next_candle(
     df: pd.DataFrame,
     timeframe: str,
     cfg: ForecastConfig | None = None,
+    realized_model_weights: dict[str, float] | None = None,
 ) -> ForecastResult:
-    """Forecast one next native candle using chronological validation only."""
+    """Forecast one next candle with chronological validation and optional live-score weights."""
     cfg = cfg or ForecastConfig()
     frame = build_forecast_features(df)
     latest = frame.iloc[-1]
@@ -172,7 +248,7 @@ def forecast_next_candle(
     y_all = train["target_return"].astype(float)
     X_now = frame.iloc[[-1]][FORECAST_FEATURES]
 
-    models = _regression_models(cfg.random_state)
+    models = _regression_models(cfg.random_state, cfg.use_advanced_models)
     val_predictions: dict[str, np.ndarray] = {}
     maes: dict[str, float] = {}
     y_val_np = y_val.to_numpy()
@@ -184,8 +260,12 @@ def forecast_next_candle(
         maes[name] = float(np.mean(np.abs(y_val_np - pred)))
 
     inverse = {name: 1.0 / max(mae, 1e-8) for name, mae in maes.items()}
-    inv_total = sum(inverse.values())
-    weights = {name: value / inv_total for name, value in inverse.items()}
+    validation_weights = _normalize_weights(inverse, list(models))
+    weights, weighting_mode = _blend_weights(
+        validation_weights,
+        realized_model_weights,
+        cfg.realized_weight_blend,
+    )
 
     val_ensemble = sum(val_predictions[name] * weights[name] for name in models)
     residuals = y_val_np - val_ensemble
@@ -251,11 +331,14 @@ def forecast_next_candle(
         confidence=confidence,
         trend=trend,
         research_signal=signal,
+        market_regime=_market_regime(latest),
         realized_volatility_pct=float(latest["vol_16"] * 100.0),
         validation_mae_pct=validation_mae * 100.0,
         validation_direction_accuracy=direction_accuracy,
         model_agreement=model_agreement,
         model_predictions_pct={k: v * 100.0 for k, v in current_predictions.items()},
         model_weights=weights,
+        validation_model_weights=validation_weights,
+        weighting_mode=weighting_mode,
         training_rows=len(train),
     )
