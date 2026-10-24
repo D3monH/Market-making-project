@@ -1,4 +1,4 @@
-exchange: gateio
+exchange: gate
 symbols:
   - BTC/USDT
   - ETH/USDT
