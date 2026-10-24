@@ -37,11 +37,64 @@ def _db_path(results_dir: str | Path) -> Path:
 
 
 def _forecast_id(row: dict) -> str:
+    """Stable id for one forecast target.
+
+    Re-running the same symbol/timeframe while the same base candle is still the
+    latest closed candle must not create another prediction record. The base
+    candle open timestamp (`as_of`) uniquely identifies that target candle.
+    """
     key = "|".join(
         str(row.get(name, ""))
-        for name in ("exchange", "symbol", "timeframe", "forecast_run_at", "as_of")
+        for name in ("exchange", "symbol", "timeframe", "as_of")
     )
     return hashlib.sha256(key.encode("utf-8")).hexdigest()[:32]
+
+
+def _deduplicate_existing_forecasts(conn: sqlite3.Connection) -> None:
+    """Repair databases created before forecasts were keyed by base candle.
+
+    Prefer a settled record if one exists. Otherwise keep the earliest real
+    prediction so repeated button clicks cannot rewrite/cherry-pick history.
+    """
+    groups = conn.execute(
+        """
+        SELECT exchange, symbol, timeframe, as_of, COUNT(*) AS n
+        FROM forecasts
+        GROUP BY exchange, symbol, timeframe, as_of
+        HAVING COUNT(*) > 1
+        """
+    ).fetchall()
+
+    for group in groups:
+        rows = conn.execute(
+            """
+            SELECT rowid, status, forecast_run_at
+            FROM forecasts
+            WHERE exchange = ? AND symbol = ? AND timeframe = ? AND as_of = ?
+            ORDER BY
+                CASE WHEN status = 'SETTLED' THEN 0 ELSE 1 END,
+                forecast_run_at ASC,
+                rowid ASC
+            """,
+            (group["exchange"], group["symbol"], group["timeframe"], group["as_of"]),
+        ).fetchall()
+        if len(rows) <= 1:
+            continue
+        keep_rowid = rows[0]["rowid"]
+        conn.execute(
+            """
+            DELETE FROM forecasts
+            WHERE exchange = ? AND symbol = ? AND timeframe = ? AND as_of = ?
+              AND rowid <> ?
+            """,
+            (
+                group["exchange"],
+                group["symbol"],
+                group["timeframe"],
+                group["as_of"],
+                keep_rowid,
+            ),
+        )
 
 
 def _connect(results_dir: str | Path) -> sqlite3.Connection:
@@ -95,6 +148,14 @@ def _connect(results_dir: str | Path) -> sqlite3.Connection:
         );
         """
     )
+
+    _deduplicate_existing_forecasts(conn)
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_forecast_base_candle
+        ON forecasts(exchange, symbol, timeframe, as_of)
+        """
+    )
     return conn
 
 
@@ -102,8 +163,13 @@ def _prepare_row(row: dict) -> dict:
     timeframe = str(row["timeframe"])
     as_of = _utc_timestamp(row["as_of"])
     delta = _timeframe_delta(timeframe)
+
+    # CCXT candle timestamps are candle OPEN timestamps. If `as_of` is 20:00
+    # for a 15m candle, its close is 20:15. We use that 20:15 close as the base
+    # price and predict the next candle, which closes at 20:30.
     target_open = as_of + delta
     target_close = target_open + delta
+
     prepared = dict(row)
     prepared["forecast_id"] = row.get("forecast_id") or _forecast_id(row)
     prepared["as_of"] = as_of.isoformat()
@@ -206,7 +272,7 @@ def load_forecast_records(
     if symbol:
         sql += " WHERE symbol = ?"
         params.append(symbol)
-    sql += " ORDER BY forecast_run_at DESC LIMIT ?"
+    sql += " ORDER BY target_close_at DESC LIMIT ?"
     params.append(max(1, int(limit)))
     with _connect(results_dir) as conn:
         rows = conn.execute(sql, params).fetchall()
@@ -303,7 +369,7 @@ def settle_due_forecasts(
                     ),
                 )
                 settled += 1
-            except Exception as exc:  # keep other due forecasts moving
+            except Exception as exc:
                 errors.append(f"{row['symbol']} {row['timeframe']}: {exc}")
 
     remaining_due = len(pending_due_forecasts(results_dir, now=now, limit=10_000))
