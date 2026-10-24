@@ -55,6 +55,7 @@ def _merge_frames(*frames: pd.DataFrame) -> pd.DataFrame:
         return _empty_frame()
     merged = pd.concat(usable).sort_index()
     merged = merged[~merged.index.duplicated(keep="last")]
+    merged.index.name = "timestamp"
     return merged
 
 
@@ -109,7 +110,8 @@ def load_cached_forecast_ohlcv(
             bars,
             daily_timezone=daily_timezone,
         )
-        merged = fresh.copy()
+        merged = fresh.copy().sort_index()
+        merged.index.name = "timestamp"
         downloaded_rows = len(fresh)
         refresh_mode = "cold_start"
     else:
@@ -151,7 +153,8 @@ def load_cached_forecast_ohlcv(
                 merged = _merge_frames(merged, repair)
                 refresh_mode = "gap_repair"
         except Exception as exc:
-            merged = cached.copy()
+            merged = cached.copy().sort_index()
+            merged.index.name = "timestamp"
             refresh_mode = "offline_cache"
             refresh_error = str(exc)
 
@@ -159,13 +162,13 @@ def load_cached_forecast_ohlcv(
     if result.empty:
         raise RuntimeError(f"No cached OHLCV available for {symbol} / {timeframe}")
 
-    # Formal predictions are allowed only when the resulting tail is still
-    # recent enough for the selected candle period.
     ensure_recent_closed_data(result, timeframe)
 
     if use_cache and refresh_mode != "offline_cache":
         path.parent.mkdir(parents=True, exist_ok=True)
-        save_cache(merged, path)
+        cache_to_write = merged.copy()
+        cache_to_write.index.name = "timestamp"
+        save_cache(cache_to_write, path)
 
     result.attrs["cache_enabled"] = bool(use_cache)
     result.attrs["cache_path"] = str(path)
