@@ -7,6 +7,8 @@ from typing import Iterable
 
 import pandas as pd
 
+from quant_mm.forecast_store import load_forecast_records, persist_forecasts
+
 
 _TIMEFRAME_RE = re.compile(r"^(\d+)([mhdw])$")
 
@@ -18,7 +20,7 @@ def timeframe_to_timedelta(timeframe: str) -> pd.Timedelta:
         raise ValueError(f"Unsupported timeframe: {timeframe}")
     value = int(match.group(1))
     unit = match.group(2)
-    mapping = {"m": "min", "h": "h", "d": "d", "w": "w"}
+    mapping = {"m": "min", "h": "h", "d": "D", "w": "W"}
     return pd.Timedelta(value, unit=mapping[unit])
 
 
@@ -42,7 +44,7 @@ def build_price_projection(
 
 
 def save_forecast_run(rows: Iterable[dict], results_dir: str | Path) -> tuple[Path, Path]:
-    """Persist latest forecast and append an immutable JSONL history."""
+    """Persist latest forecast, append JSONL history, and insert into SQLite verification store."""
     payload = list(rows)
     out_dir = Path(results_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -56,22 +58,29 @@ def save_forecast_run(rows: Iterable[dict], results_dir: str | Path) -> tuple[Pa
         for row in payload:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
+    persist_forecasts(payload, results_dir)
     return latest_path, history_path
 
 
 def load_forecast_history(results_dir: str | Path, limit: int = 300) -> pd.DataFrame:
-    path = Path(results_dir) / "forecast_history.jsonl"
-    if not path.exists():
-        return pd.DataFrame()
+    """Load persistent forecast records, including settlement results when available."""
+    try:
+        return load_forecast_records(results_dir, limit=limit)
+    except Exception:
+        # Fallback keeps older installations readable even if the SQLite store
+        # cannot be opened for some reason.
+        path = Path(results_dir) / "forecast_history.jsonl"
+        if not path.exists():
+            return pd.DataFrame()
 
-    rows: list[dict] = []
-    with path.open("r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                rows.append(json.loads(line))
-            except json.JSONDecodeError:
-                continue
-    return pd.DataFrame(rows[-max(1, int(limit)):])
+        rows: list[dict] = []
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rows.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+        return pd.DataFrame(rows[-max(1, int(limit)):])
