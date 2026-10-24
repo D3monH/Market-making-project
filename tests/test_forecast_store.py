@@ -55,6 +55,45 @@ def test_forecast_target_times_and_pending_boundary(tmp_path):
     assert len(pending_due_forecasts(results_dir, now=at_close)) == 1
 
 
+def test_repeated_click_same_base_candle_does_not_create_duplicate(tmp_path):
+    results_dir = tmp_path / "forecast"
+    first = sample_forecast(
+        forecast_run_at="2026-10-24T10:16:00+00:00",
+        expected_price=101.0,
+    )
+    repeated = sample_forecast(
+        forecast_run_at="2026-10-24T10:29:00+00:00",
+        expected_price=105.0,
+        expected_return_pct=5.0,
+    )
+
+    assert persist_forecasts([first], results_dir) == 1
+    assert persist_forecasts([repeated], results_dir) == 0
+
+    records = load_forecast_records(results_dir)
+    assert len(records) == 1
+    row = records.iloc[0]
+    assert row["forecast_run_at"] == "2026-10-24T10:16:00+00:00"
+    assert row["expected_price"] == pytest.approx(101.0)
+    assert row["target_close_at"].startswith("2026-10-24T10:30:00")
+
+
+def test_new_closed_base_candle_creates_new_forecast(tmp_path):
+    results_dir = tmp_path / "forecast"
+    first = sample_forecast(as_of="2026-10-24T10:00:00+00:00")
+    next_candle = sample_forecast(
+        forecast_run_at="2026-10-24T10:31:00+00:00",
+        as_of="2026-10-24T10:15:00+00:00",
+        current_price=101.5,
+        expected_price=102.0,
+    )
+
+    assert persist_forecasts([first], results_dir) == 1
+    assert persist_forecasts([next_candle], results_dir) == 1
+    records = load_forecast_records(results_dir)
+    assert len(records) == 2
+
+
 def test_settlement_records_actual_result_and_accuracy(tmp_path):
     results_dir = tmp_path / "forecast"
     persist_forecasts([sample_forecast()], results_dir)

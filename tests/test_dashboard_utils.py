@@ -7,6 +7,7 @@ import pandas as pd
 
 from quant_mm.dashboard_utils import (
     build_price_projection,
+    forecast_window,
     load_forecast_history,
     save_forecast_run,
     timeframe_to_timedelta,
@@ -19,14 +20,25 @@ def test_timeframe_to_timedelta():
     assert timeframe_to_timedelta("1d") == pd.Timedelta(days=1)
 
 
-def test_build_price_projection_adds_one_future_point():
+def test_forecast_window_uses_last_closed_candle_close_as_base():
+    window = forecast_window("2026-10-24T12:00:00+00:00", "15m")
+    assert window["base_open_at"] == pd.Timestamp("2026-10-24T12:00:00+00:00")
+    assert window["base_close_at"] == pd.Timestamp("2026-10-24T12:15:00+00:00")
+    assert window["target_open_at"] == pd.Timestamp("2026-10-24T12:15:00+00:00")
+    assert window["target_close_at"] == pd.Timestamp("2026-10-24T12:30:00+00:00")
+
+
+def test_build_price_projection_uses_close_times():
     idx = pd.date_range("2026-01-01", periods=5, freq="15min", tz="UTC")
     market = pd.DataFrame({"close": [100, 101, 102, 103, 104]}, index=idx)
     chart = build_price_projection(market, expected_price=105.5, timeframe="15m", history_points=5)
 
-    assert chart.index[-1] == idx[-1] + pd.Timedelta(minutes=15)
-    assert chart.loc[idx[-1], "预测收盘价"] == 104.0
-    assert chart.iloc[-1]["预测收盘价"] == 105.5
+    base_close_at = idx[-1] + pd.Timedelta(minutes=15)
+    target_close_at = idx[-1] + pd.Timedelta(minutes=30)
+    assert chart.index[-1] == target_close_at
+    assert chart.loc[base_close_at, "实际收盘价"] == 104.0
+    assert chart.loc[base_close_at, "预测收盘价"] == 104.0
+    assert chart.loc[target_close_at, "预测收盘价"] == 105.5
 
 
 def test_save_and_load_forecast_history(tmp_path):
