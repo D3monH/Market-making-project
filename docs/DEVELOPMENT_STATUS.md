@@ -1,6 +1,6 @@
 # Development Status / Codex Handoff
 
-Last updated: 2026-10-24
+Last updated: 2026-10-25
 
 This document is the current handoff snapshot for ChatGPT/Codex or a human developer taking over the repository.
 
@@ -11,6 +11,7 @@ The repository is evolving from a simple market-making experiment into a small c
 ```text
 Market data
   -> deterministic candle/time semantics
+  -> persistent local OHLCV cache / incremental sync
   -> feature/model research
   -> multi-horizon next-close forecasts
   -> persistent out-of-sample verification
@@ -78,6 +79,19 @@ Outputs include:
 - market regime
 - per-model predictions and weights
 
+Current weighting layers:
+
+1. chronological validation weights
+2. optional realized out-of-sample model weights after the configured minimum sample count
+3. optional bounded manual model multipliers (0.25x..2.0x), then renormalization
+
+Current training-sample weighting:
+
+- `recency_half_life_bars: 0` = disabled / equal sample weight
+- when enabled, exponential decay is applied only during model fitting
+- chronological train/validation order remains unchanged
+- validation metrics remain out-of-sample and are not rewritten by manual preferences
+
 ### D. Persistent forecast verification
 
 Files: `quant_mm/forecast_store.py`, `forecast_monitor.py`
@@ -131,6 +145,38 @@ Gate public derivatives context:
 The alpha layer intentionally does not rewrite the forecasted next close. It produces a separate consensus/risk overlay so new factors can prove themselves out-of-sample first.
 
 Database: `results/forecast/alpha_history.sqlite3`
+
+### G. Persistent local OHLCV cache
+
+File: `quant_mm/market_cache.py`
+
+Default location:
+
+```text
+data/cache/ohlcv/<exchange>/<symbol>/<timeframe>.csv
+```
+
+Behavior:
+
+- first use: download the requested forecast-history window
+- later use: estimate how many candles could have appeared, fetch a small recent overlap, merge and deduplicate
+- cached history is retained and grows over time; it is not truncated to the current `bars` or `train_window`
+- if the selected tail contains gaps, one recent full-window repair is attempted
+- if the exchange temporarily fails, a recent cache can be used only if it still passes the standard stale-data check
+- stale cache never produces a formal prediction
+
+Metadata exposed through `DataFrame.attrs`:
+
+- `cache_refresh_mode`: `cold_start`, `incremental`, `gap_repair`, `offline_cache`, or `network_only`
+- `cache_rows_total`
+- `downloaded_rows_this_run`
+- `missing_intervals`
+- `cache_path`
+- `cache_refresh_error`
+- `last_candle_open_at`
+- `candle_basis`
+
+The main dashboard, forecast CLI and Institutional Alpha price-model path all use this cache by default.
 
 ## 3. Non-negotiable time semantics
 
@@ -191,19 +237,7 @@ safe maximum:    9,900 points
 
 Large requested histories degrade gracefully to the maximum recent valid window. Pagination still moves forward to the newest fully closed candle.
 
-### Important change after the daily-boundary correction
-
-New Gate `1d` forecasts now request native `1d` candles directly. They no longer require six 4h candles per day.
-
-Therefore a request for 5,000 daily candles no longer expands into ~30,000 source 4h candles. It asks for native daily data and is subject only to Gate's daily history availability / lookback cap.
-
-The returned DataFrame contains metadata in `df.attrs`:
-
-- `requested_bars`
-- `returned_bars`
-- `venue_history_limit_points`
-- `history_limited`
-- `candle_basis` on forecast frames
+New Gate `1d` forecasts request native `1d` candles directly and do not expand each day into six 4h candles.
 
 Do not bypass the centralized data layer from Streamlit pages.
 
@@ -215,8 +249,6 @@ Observed failure mode on Windows/CCXT:
 ccxt.base.errors.RequestTimeout
 gate GET https://api.gateio.ws/api/v4/spot/currencies
 ```
-
-CCXT `load_markets()` fetches currencies when `has['fetchCurrencies']` is enabled. The forecasting and Institutional Alpha research paths do not require Gate currency/deposit-withdraw metadata, only market-pair metadata plus public ticker/OHLCV data.
 
 Current policy in `quant_mm/data.py`:
 
@@ -232,8 +264,6 @@ The same bounded retry helper is used by public ticker and OHLCV requests. Param
 
 Institutional Alpha catches exhausted market-data network failures and renders a concise Streamlit error instead of exposing a full traceback. If the run fails before a forecast is successfully built, no new forecast/alpha record is persisted.
 
-Do not re-enable Gate `fetchCurrencies` on the forecasting data path unless a feature actually requires currency metadata and the timeout behavior is covered by tests.
-
 ## 5. Data integrity protections already implemented
 
 - Gate legacy exchange id `gateio` normalizes to CCXT `gate`.
@@ -241,12 +271,15 @@ Do not re-enable Gate `fetchCurrencies` on the forecasting data path unless a fe
 - Stale latest candles are rejected.
 - In-progress candles are excluded from forecast inputs.
 - Duplicate forecasts for the same target are prevented.
-- New Gate 1d forecast basis is `gate_native_utc_day` at the data-policy layer.
-- Dashboard/config compatibility may expose UTC as the daily timezone label; with `Asia/Shanghai` display this yields 08:00 daily close times.
+- New Gate 1d forecast basis is `gate_native_utc_day`.
 - Legacy `natural_day:Asia/Shanghai` records remain historical compatibility data and must stay separate from new daily statistics.
-- Transient public API timeouts are retried centrally; routine timeout failures should not crash the Streamlit research UI.
+- Transient public API timeouts are retried centrally.
+- Persistent OHLCV cache is incremental and deduplicated.
+- Offline cache fallback is allowed only when recency validation still passes.
+- Manual model multipliers are bounded and do not rewrite realized historical scores.
+- Recency sample weighting preserves chronological validation and does not introduce lookahead.
 
-## 6. Current databases
+## 6. Persistent storage
 
 ### Forecast DB
 
@@ -260,7 +293,13 @@ Long-lived source of truth for forecast out-of-sample performance.
 
 Long-lived source of truth for factor/consensus out-of-sample performance.
 
-Do not delete these databases as a normal migration strategy. Use schema migrations/backward-compatible columns where practical.
+### Market cache
+
+`data/cache/ohlcv/...`
+
+Long-lived public OHLCV working set for training/research. It is local derived market data, not a replacement for the forecast/alpha verification databases.
+
+Do not delete SQLite databases as a normal migration strategy. Cache files may be rebuilt from public market data if necessary, but should normally be preserved so local history can grow.
 
 ## 7. Gate private execution status
 
@@ -293,37 +332,42 @@ Primary command:
 python -m pytest -q
 ```
 
-GitHub Actions runs the same test suite.
-
 Important regression files:
 
 - `tests/test_data_recency.py`
 - `tests/test_gate_history_limit.py`
 - `tests/test_gate_timeout_resilience.py`
+- `tests/test_market_cache.py`
 - `tests/test_forecast.py`
+- `tests/test_forecast_custom_weights.py`
 - `tests/test_forecast_time_alignment.py`
 - `tests/test_forecast_store.py`
 - `tests/test_model_performance.py`
 - `tests/test_institutional_alpha.py`
 - `tests/test_v02.py`
 
-Do not merge changes to data/time/persistence semantics without a test that demonstrates the expected invariant.
+Do not merge changes to data/time/persistence/model-weight semantics without a test that demonstrates the expected invariant.
 
 ## 9. Recommended next development order
 
 ### P0 - stability / observability
 
-- Surface requested vs effective history bars in both Streamlit pages.
-- Add data-source health panel: last closed timestamp, returned rows, venue cap, stale status, retry/last-error status.
-- Add migration/version number to SQLite metadata.
-- Extend structured UI errors to the main dashboard and background monitor where useful.
+Completed items that should not regress:
 
-Completed P0 items that should not regress:
+- explicit candle-basis labels
+- Gate timeout/currency-skip policy
+- structured Streamlit market-data errors
+- persistent incremental OHLCV cache
+- cache health metadata in dashboard / Institutional Alpha
+- stale-cache rejection
+- optional recency weighting and bounded manual model multipliers
 
-- Explicit candle-basis labels in Dashboard/Institutional Alpha.
-- Alpha `candle_basis` persistence so old/new daily cohorts remain separated.
-- Gate public API currency-skip + bounded timeout retry policy.
-- Institutional Alpha no longer exposes routine market-data timeout tracebacks.
+Remaining P0:
+
+- background cache prefetch/sync utility for configured symbols/timeframes
+- cache health summary page across all symbols/timeframes
+- checksum/version metadata for local cache files
+- SQLite schema version metadata
 
 ### P1 - historical derivatives data aligned to candles
 
@@ -379,7 +423,9 @@ A substantial change is not done until:
 2. No future data leakage is introduced.
 3. Persistent forecast uniqueness is preserved.
 4. New market-data endpoints fail gracefully.
-5. Tests are added/updated.
-6. `python -m pytest -q` passes.
-7. Relevant documentation and `CHANGELOG.md` are updated.
-8. PR CI is green before merge.
+5. Local cache cannot silently serve stale data for a formal forecast.
+6. Manual/model weighting changes remain bounded and observable.
+7. Tests are added/updated.
+8. `python -m pytest -q` passes.
+9. Relevant documentation and `CHANGELOG.md` are updated.
+10. PR CI is green before merge.
