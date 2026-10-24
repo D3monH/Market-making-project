@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Any
 
 import numpy as np
@@ -18,6 +18,8 @@ FORECAST_FEATURES = [
     "ema_fast_distance", "ema_slow_distance", "rsi_14",
 ]
 
+MODEL_NAMES = ["linear", "ridge", "hist_gb", "elastic_net", "extra_trees"]
+
 
 @dataclass(frozen=True)
 class ForecastConfig:
@@ -31,6 +33,17 @@ class ForecastConfig:
     use_advanced_models: bool = True
     realized_weight_blend: float = 0.65
     realized_weight_min_samples: int = 30
+
+    # Optional recency weighting for model fitting. 0 disables it. A value such
+    # as 1500 means a sample 1500 bars older receives half the weight of the
+    # newest sample. This affects training only; validation metrics remain
+    # chronological out-of-sample metrics.
+    recency_half_life_bars: float = 0.0
+
+    # Optional human research preference layered on top of automatic ensemble
+    # weights. Values are bounded to [0.25, 2.0] before normalization so one
+    # manual setting cannot silently dominate the entire ensemble.
+    manual_model_multipliers: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -56,6 +69,8 @@ class ForecastResult:
     validation_model_weights: dict[str, float]
     weighting_mode: str
     training_rows: int
+    recency_half_life_bars: float
+    manual_model_multipliers: dict[str, float]
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -178,6 +193,46 @@ def _blend_weights(
     return _normalize_weights(mixed, names), "validation_plus_realized"
 
 
+def _recency_weights(length: int, half_life_bars: float) -> np.ndarray | None:
+    if length <= 0 or float(half_life_bars) <= 0.0:
+        return None
+    half_life = max(float(half_life_bars), 1.0)
+    ages = np.arange(length - 1, -1, -1, dtype=float)
+    weights = np.power(0.5, ages / half_life)
+    return weights / max(float(np.mean(weights)), 1e-12)
+
+
+def _fit_with_sample_weight(model, X, y, sample_weight: np.ndarray | None):
+    if sample_weight is None:
+        model.fit(X, y)
+        return model
+    if hasattr(model, "steps"):
+        final_step_name = model.steps[-1][0]
+        model.fit(X, y, **{f"{final_step_name}__sample_weight": sample_weight})
+    else:
+        model.fit(X, y, sample_weight=sample_weight)
+    return model
+
+
+def _apply_manual_multipliers(
+    weights: dict[str, float],
+    multipliers: dict[str, float] | None,
+) -> tuple[dict[str, float], bool, dict[str, float]]:
+    names = list(weights)
+    if not multipliers:
+        return _normalize_weights(weights, names), False, {name: 1.0 for name in names}
+
+    bounded: dict[str, float] = {}
+    changed = False
+    adjusted: dict[str, float] = {}
+    for name in names:
+        multiplier = float(np.clip(float(multipliers.get(name, 1.0)), 0.25, 2.0))
+        bounded[name] = multiplier
+        changed = changed or abs(multiplier - 1.0) > 1e-12
+        adjusted[name] = float(weights.get(name, 0.0)) * multiplier
+    return _normalize_weights(adjusted, names), changed, bounded
+
+
 def _market_regime(latest: pd.Series) -> str:
     vol_16 = max(float(latest.get("vol_16", 0.0)), 1e-9)
     vol_48 = max(float(latest.get("vol_48", vol_16)), 1e-9)
@@ -249,13 +304,16 @@ def forecast_next_candle(
     y_all = train["target_return"].astype(float)
     X_now = frame.iloc[[-1]][FORECAST_FEATURES]
 
+    fit_sample_weight = _recency_weights(len(fit), cfg.recency_half_life_bars)
+    all_sample_weight = _recency_weights(len(train), cfg.recency_half_life_bars)
+
     models = _regression_models(cfg.random_state, cfg.use_advanced_models)
     val_predictions: dict[str, np.ndarray] = {}
     maes: dict[str, float] = {}
     y_val_np = y_val.to_numpy()
 
     for name, model in models.items():
-        model.fit(X_fit, y_fit)
+        _fit_with_sample_weight(model, X_fit, y_fit, fit_sample_weight)
         pred = np.asarray(model.predict(X_val), dtype=float)
         val_predictions[name] = pred
         maes[name] = float(np.mean(np.abs(y_val_np - pred)))
@@ -267,6 +325,12 @@ def forecast_next_candle(
         realized_model_weights,
         cfg.realized_weight_blend,
     )
+    weights, manual_changed, bounded_multipliers = _apply_manual_multipliers(
+        weights,
+        cfg.manual_model_multipliers,
+    )
+    if manual_changed:
+        weighting_mode += "_plus_manual"
 
     val_ensemble = sum(val_predictions[name] * weights[name] for name in models)
     residuals = y_val_np - val_ensemble
@@ -277,7 +341,7 @@ def forecast_next_candle(
 
     current_predictions: dict[str, float] = {}
     for name, model in models.items():
-        model.fit(X_all, y_all)
+        _fit_with_sample_weight(model, X_all, y_all, all_sample_weight)
         current_predictions[name] = float(model.predict(X_now)[0])
 
     expected_return = float(
@@ -292,7 +356,7 @@ def forecast_next_candle(
             StandardScaler(),
             LogisticRegression(C=0.7, max_iter=1000, random_state=cfg.random_state),
         )
-        classifier.fit(X_all, y_direction)
+        _fit_with_sample_weight(classifier, X_all, y_direction, all_sample_weight)
         up_probability = float(classifier.predict_proba(X_now)[0, 1])
 
     pred_values = np.asarray(list(current_predictions.values()), dtype=float)
@@ -342,4 +406,6 @@ def forecast_next_candle(
         validation_model_weights=validation_weights,
         weighting_mode=weighting_mode,
         training_rows=len(train),
+        recency_half_life_bars=float(max(0.0, cfg.recency_half_life_bars)),
+        manual_model_multipliers=bounded_multipliers,
     )

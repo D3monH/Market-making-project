@@ -27,13 +27,24 @@ This repository is an experimental crypto quantitative-research platform. Read `
 
 ## Market-data constraints
 
-- All forecast market-data access should flow through `quant_mm/data.py`.
+- All forecast market-data access should flow through `quant_mm/data.py` and, for normal forecast/Alpha UI/CLI usage, through `quant_mm/market_cache.py`.
+- Persistent OHLCV cache files live under `data/cache/ohlcv/<exchange>/<symbol>/<timeframe>.csv` by default. First use downloads a requested window; later runs refresh only a small recent overlap, merge, deduplicate and retain the full local history. Do not truncate the cache to the current training-window size.
+- A cache may be used during a temporary exchange outage only if the latest cached closed candle still passes the normal recency check. Stale cache must never produce a formal forecast.
+- Cache metadata (`cache_refresh_mode`, total rows, downloaded rows, missing intervals, cache path) should remain observable in the research UI.
 - Gate spot candlesticks reject excessively old `since/from` windows. The data layer contains a venue-aware history cap and safety margin. Do not bypass it by calling CCXT OHLCV directly from Streamlit pages.
 - Gate public research instances intentionally set `exchange.has['fetchCurrencies'] = False` before `load_markets()`. The project only needs market-pair metadata for public ticker/OHLCV research, and `/spot/currencies` has caused avoidable startup timeouts. Do not re-enable it without a concrete requirement and regression coverage.
 - Public CCXT network requests use bounded retries for transient `NetworkError` / `RequestTimeout` failures. Do not retry exchange parameter/validation errors as if they were network failures.
 - A requested bar count is a preferred target. If a venue cannot supply that much history, use the maximum recent valid window and let the model's minimum-row checks decide whether training is possible.
 - Do not reintroduce the old bug where pagination stops as soon as `bars` rows are collected before reaching current closed candles.
 - `resample_daily_ohlcv()` exists for legacy-data compatibility; it is not the source for new Gate 1d forecasts.
+
+## Model-weighting constraints
+
+- Automatic validation / realized out-of-sample weights remain the default.
+- Optional `recency_half_life_bars` affects model fitting only; it must not leak future information or reorder the chronological validation split.
+- Optional `manual_model_multipliers` are a bounded research overlay after automatic weights. Runtime bounds are 0.25x..2.0x and final weights are renormalized.
+- Manual preferences must never rewrite historical predictions or realized score history.
+- If adding a new estimator, verify that its training path supports sample weights or explicitly documents why it does not.
 
 ## UI error-handling constraints
 
@@ -49,7 +60,9 @@ This repository is an experimental crypto quantitative-research platform. Read `
 - `dashboard.py`: main Streamlit forecast dashboard.
 - `pages/01_Institutional_Alpha.py`: institutional-style alpha research page.
 - `forecast_monitor.py`: long-running forecast maturity/verification monitor.
-- `quant_mm/forecast_engine.py`: next-candle ensemble forecast model.
+- `quant_mm/data.py`: exchange-native market-data transport, time semantics, retry/history guards.
+- `quant_mm/market_cache.py`: persistent incremental OHLCV cache and data-quality metadata.
+- `quant_mm/forecast_engine.py`: next-candle ensemble forecast model, recency sample weights and bounded manual model multipliers.
 - `quant_mm/forecast_store.py`: persistent forecast SQLite + maturity verification.
 - `quant_mm/model_performance.py`: model-level realized leaderboard and dynamic weights.
 - `quant_mm/institutional_alpha.py`: independent factor/derivatives alpha layer.
@@ -62,13 +75,16 @@ This repository is an experimental crypto quantitative-research platform. Read `
 python -m pytest -q
 ```
 
-When touching forecast time/data semantics, specifically review:
+When touching forecast time/data/model semantics, specifically review:
 
 - `tests/test_data_recency.py`
 - `tests/test_forecast_time_alignment.py`
 - `tests/test_forecast_store.py`
 - `tests/test_gate_history_limit.py`
 - `tests/test_gate_timeout_resilience.py`
+- `tests/test_market_cache.py`
+- `tests/test_forecast_custom_weights.py`
+- `tests/test_forecast.py`
 - `tests/test_institutional_alpha.py`
 - `tests/test_model_performance.py`
 
@@ -85,7 +101,7 @@ For meaningful architecture/data-semantics changes:
 
 Priority order:
 
-1. Stabilize data quality, time alignment, persistence and verification.
+1. Stabilize data quality, time alignment, local cache, persistence and verification.
 2. Historical Funding/OI/Basis/Liquidation/Taker-flow datasets aligned to forecast candles.
 3. Cross-asset BTC/ETH/SOL features and market breadth.
 4. Alpha realized-performance weighting and correlation-aware portfolio of alphas.

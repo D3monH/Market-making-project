@@ -13,6 +13,13 @@ timeframes:
 bars: 5000
 results_dir: results/forecast
 
+# Persistent public OHLCV cache.
+# First run downloads the requested history; later runs refresh only a small
+# recent overlap and append/deduplicate it. Cache files keep growing over time.
+market_data:
+  use_cache: true
+  cache_dir: data/cache/ohlcv
+
 # Forecast clock policy.
 # - All new forecasts use exchange-native candle boundaries.
 # - Gate native 1d candles use UTC 00:00 -> next UTC 00:00.
@@ -42,6 +49,16 @@ forecast:
   # out-of-sample realized model performance with current validation weights.
   realized_weight_blend: 0.65
   realized_weight_min_samples: 30
+
+  # Optional training-sample recency weighting. 0 disables it.
+  # Example: 1500 means a sample 1500 bars older has about half the training
+  # weight of the newest sample. Dashboard can override this interactively.
+  recency_half_life_bars: 0
+
+  # Optional human preference multipliers applied after automatic validation /
+  # realized-performance weights, then normalized. Runtime bounds: 0.25x..2.0x.
+  # Leave empty for fully automatic model weighting.
+  manual_model_multipliers: {}
 
 # Institutional alpha layer.
 # This is intentionally separated from the next-close price model until enough
