@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pandas as pd
 
@@ -46,3 +47,8 @@ def test_save_and_load_forecast_history(tmp_path):
     history = load_forecast_history(tmp_path)
     assert len(history) == 1
     assert history.iloc[0]["timeframe"] == "15m"
+
+
+def test_dashboard_source_compiles():
+    source = Path("dashboard.py").read_text(encoding="utf-8")
+    compile(source, "dashboard.py", "exec")
