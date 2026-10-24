@@ -15,6 +15,10 @@ from quant_mm.data import (
 )
 
 
+class FakeNetworkError(Exception):
+    pass
+
+
 def _four_hour_market(days: int = 3) -> pd.DataFrame:
     periods = days * 6
     idx = pd.date_range(
@@ -138,7 +142,11 @@ def test_native_daily_verification_fetches_exchange_1d(monkeypatch):
             assert since == target_ms
             return [row]
 
-    monkeypatch.setitem(sys.modules, "ccxt", SimpleNamespace(gate=FakeGate))
+    monkeypatch.setitem(
+        sys.modules,
+        "ccxt",
+        SimpleNamespace(gate=FakeGate, NetworkError=FakeNetworkError),
+    )
 
     candle = fetch_closed_candle(
         "gate",
@@ -180,7 +188,7 @@ def test_legacy_daily_verification_still_aggregates_old_24h_window(monkeypatch):
         has = {"fetchOHLCV": True, "fetchTicker": True}
 
         def __init__(self, _config):
-            pass
+            self.id = "gate"
 
         def load_markets(self):
             return None
@@ -198,7 +206,11 @@ def test_legacy_daily_verification_still_aggregates_old_24h_window(monkeypatch):
             assert since == target_ms
             return rows
 
-    monkeypatch.setitem(sys.modules, "ccxt", SimpleNamespace(gate=FakeGate))
+    monkeypatch.setitem(
+        sys.modules,
+        "ccxt",
+        SimpleNamespace(gate=FakeGate, NetworkError=FakeNetworkError),
+    )
 
     candle = fetch_closed_candle(
         "gate",
