@@ -30,6 +30,17 @@ def _db_path(results_dir: str | Path) -> Path:
     return path / DB_FILENAME
 
 
+def _ensure_column(
+    conn: sqlite3.Connection,
+    table: str,
+    column: str,
+    ddl: str,
+) -> None:
+    columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    if column not in columns:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
+
+
 def _connect(results_dir: str | Path) -> sqlite3.Connection:
     conn = sqlite3.connect(_db_path(results_dir))
     conn.row_factory = sqlite3.Row
@@ -58,6 +69,7 @@ def _connect(results_dir: str | Path) -> sqlite3.Connection:
             factor_weights_json TEXT NOT NULL,
             raw_context_json TEXT NOT NULL,
             source TEXT NOT NULL,
+            candle_basis TEXT NOT NULL DEFAULT 'legacy_alpha_unversioned',
             status TEXT NOT NULL DEFAULT 'PENDING',
             settled_at TEXT,
             actual_close REAL,
@@ -70,6 +82,12 @@ def _connect(results_dir: str | Path) -> sqlite3.Connection:
         CREATE INDEX IF NOT EXISTS idx_alpha_due
             ON alpha_forecasts(status, target_close_at);
         """
+    )
+    _ensure_column(
+        conn,
+        "alpha_forecasts",
+        "candle_basis",
+        "candle_basis TEXT NOT NULL DEFAULT 'legacy_alpha_unversioned'",
     )
     return conn
 
@@ -90,6 +108,7 @@ def persist_alpha(
     model_expected_return_pct: float,
     model_confidence: float,
     alpha: dict,
+    candle_basis: str = "legacy_alpha_unversioned",
     forecast_run_at: str | None = None,
 ) -> int:
     base_open = _utc(as_of)
@@ -107,8 +126,9 @@ def persist_alpha(
                 model_expected_return_pct, model_confidence,
                 composite_score, consensus_score, consensus_signal,
                 consensus_confidence, risk_multiplier, data_quality,
-                factor_scores_json, factor_weights_json, raw_context_json, source
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                factor_scores_json, factor_weights_json, raw_context_json, source,
+                candle_basis
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 alpha_id,
@@ -132,6 +152,7 @@ def persist_alpha(
                 json.dumps(alpha.get("factor_weights", {}), ensure_ascii=False),
                 json.dumps(alpha.get("raw_context", {}), ensure_ascii=False),
                 str(alpha.get("source", "")),
+                str(candle_basis or "legacy_alpha_unversioned"),
             ),
         )
         return int(cur.rowcount > 0)
@@ -211,7 +232,7 @@ def alpha_summary(results_dir: str | Path, symbol: str | None = None) -> pd.Data
         where += " AND symbol=?"
         params.append(symbol)
     sql = f"""
-        SELECT symbol, timeframe, COUNT(*) AS samples,
+        SELECT symbol, timeframe, candle_basis, COUNT(*) AS samples,
                AVG(direction_correct) AS direction_accuracy,
                AVG(CASE WHEN signal_correct IS NOT NULL THEN signal_correct END) AS signal_accuracy,
                AVG(ABS(actual_return_pct)) AS avg_abs_move_pct,
@@ -219,8 +240,8 @@ def alpha_summary(results_dir: str | Path, symbol: str | None = None) -> pd.Data
                AVG(data_quality) AS avg_data_quality
         FROM alpha_forecasts
         {where}
-        GROUP BY symbol, timeframe
-        ORDER BY symbol, timeframe
+        GROUP BY symbol, timeframe, candle_basis
+        ORDER BY symbol, timeframe, candle_basis
     """
     with _connect(results_dir) as conn:
         rows = conn.execute(sql, params).fetchall()
@@ -232,18 +253,23 @@ def factor_leaderboard(
     *,
     symbol: str,
     timeframe: str,
+    candle_basis: str | None = None,
     limit: int = 500,
 ) -> pd.DataFrame:
+    sql = """
+        SELECT factor_scores_json, actual_return_pct
+        FROM alpha_forecasts
+        WHERE status='SETTLED' AND symbol=? AND timeframe=?
+    """
+    params: list[object] = [symbol, timeframe]
+    if candle_basis is not None:
+        sql += " AND candle_basis=?"
+        params.append(candle_basis)
+    sql += " ORDER BY target_close_at DESC LIMIT ?"
+    params.append(max(1, int(limit)))
+
     with _connect(results_dir) as conn:
-        rows = conn.execute(
-            """
-            SELECT factor_scores_json, actual_return_pct
-            FROM alpha_forecasts
-            WHERE status='SETTLED' AND symbol=? AND timeframe=?
-            ORDER BY target_close_at DESC LIMIT ?
-            """,
-            (symbol, timeframe, max(1, int(limit))),
-        ).fetchall()
+        rows = conn.execute(sql, params).fetchall()
 
     stats: dict[str, dict[str, float]] = {}
     for record in rows:
