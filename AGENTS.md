@@ -49,7 +49,15 @@ This repository is an experimental crypto quantitative-research platform. Read `
 ## UI / desktop experience constraints
 
 - `app.py` is the preferred human-facing Streamlit entrypoint. It provides Chinese navigation and presentation translation while preserving stable internal identifiers.
-- `dashboard.py` and `pages/01_Institutional_Alpha.py` remain the research pages; do not duplicate model/data logic into `app.py`.
+- `pages/00_Quick_Direction.py` is the default daily-use page. It should answer the next-candle direction question first and keep research detail secondary.
+- `dashboard.py` and `pages/01_Institutional_Alpha.py` remain detailed research pages; do not duplicate model/data semantics in presentation code.
+- Quick direction semantics are fixed:
+  - predicted close above the previous fully closed candle close => `收涨（多） ↑`;
+  - predicted close below the previous fully closed candle close => `收跌（空） ↓`;
+  - percentage return is the primary move display;
+  - absolute price move is secondary and shown in the quote asset (for example USDT), not as a universal comparable points-return metric;
+  - use `P(up)` for an up forecast and `1-P(up)` for a down forecast;
+  - surface disagreement between regression direction and the separate probability classifier instead of hiding it.
 - User-facing labels should be Chinese by default. Keep established domain names such as BTC/ETH, Alpha, Funding, OI, Basis, Linear/Ridge/ExtraTrees when useful for recognition.
 - Do not rename persisted database fields/enums merely to make the UI Chinese. Translate at the presentation layer via `quant_mm/ui_labels.py`.
 - Human-facing tables should not expose raw values such as `PENDING`, `SETTLED`, `gate_native_utc_day`, `legacy_alpha_unversioned`, `timeframe`, or `actual_return_pct` when a Chinese label exists.
@@ -67,17 +75,19 @@ This repository is an experimental crypto quantitative-research platform. Read `
 ## Current major components
 
 - `app.py`: preferred Chinese multi-page Streamlit entrypoint.
+- `pages/00_Quick_Direction.py`: default fast next-candle long/short direction view.
 - `start_dashboard.bat`: Windows one-click local launcher.
 - `launch_dashboard_hidden.vbs` / `create_desktop_shortcut.ps1`: desktop shortcut and hidden launcher.
 - `main.py` / `quant_mm/backtest.py`: historical V0.1-style market-making backtest.
 - `gate_paper.py`: Gate public realtime paper market making; no real orders.
 - `forecast.py`: multi-horizon forecast CLI.
-- `dashboard.py`: main Streamlit forecast research page.
+- `dashboard.py`: detailed Streamlit forecast research page.
 - `pages/01_Institutional_Alpha.py`: institutional-style alpha research page.
 - `forecast_monitor.py`: long-running forecast maturity/verification monitor.
 - `quant_mm/data.py`: exchange-native market-data transport, time semantics, retry/history guards.
 - `quant_mm/market_cache.py`: persistent incremental OHLCV cache and data-quality metadata.
 - `quant_mm/ui_labels.py`: presentation-only Chinese label/value translation.
+- `quant_mm/direction_view.py`: pure next-candle direction/percentage/absolute-move presentation semantics.
 - `quant_mm/forecast_engine.py`: next-candle ensemble forecast model, recency sample weights and bounded manual model multipliers.
 - `quant_mm/forecast_store.py`: persistent forecast SQLite + maturity verification.
 - `quant_mm/model_performance.py`: model-level realized leaderboard and dynamic weights.
@@ -104,6 +114,7 @@ When touching forecast time/data/model/UI semantics, specifically review:
 - `tests/test_institutional_alpha.py`
 - `tests/test_model_performance.py`
 - `tests/test_ui_labels.py`
+- `tests/test_direction_view.py`
 
 ## Documentation discipline
 
