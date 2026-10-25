@@ -62,6 +62,7 @@ st.bar_chart = _bar_chart
 
 pages = [
     st.Page("pages/00_Quick_Direction.py", title="快速多空预测", icon="⚡", default=True),
+    st.Page("pages/02_Gate_Event_Contracts.py", title="Gate 事件合约", icon="🎯"),
     st.Page("dashboard.py", title="详细预测研究", icon="📈"),
     st.Page("pages/01_Institutional_Alpha.py", title="机构 Alpha 研究", icon="🧠"),
 ]
