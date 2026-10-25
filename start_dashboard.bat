@@ -9,12 +9,6 @@ echo   Crypto Quant Research Platform
 echo   One-click local research dashboard
 echo ==============================================
 
-powershell -NoProfile -Command "try { $r = Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:8501/_stcore/health' -TimeoutSec 1; if ($r.StatusCode -eq 200) { exit 0 } } catch {}; exit 1" >nul 2>&1
-if not errorlevel 1 (
-    start "" "http://127.0.0.1:8501"
-    exit /b 0
-)
-
 if not exist ".venv\Scripts\python.exe" (
     echo [INFO] First run: creating local Python virtual environment...
     where py >nul 2>&1
@@ -32,6 +26,7 @@ if not exist ".venv\Scripts\python.exe" (
 )
 
 set "PYTHON=.venv\Scripts\python.exe"
+set "PYTHONW=.venv\Scripts\pythonw.exe"
 
 "%PYTHON%" -c "import streamlit, ccxt, sklearn, pandas" >nul 2>&1
 if errorlevel 1 (
@@ -42,6 +37,20 @@ if errorlevel 1 (
         pause
         exit /b 1
     )
+)
+
+rem Start the singleton background auto-forecast worker. If one is already
+rem running, the new process exits immediately after failing to bind its port.
+if exist "%PYTHONW%" (
+    start "" /B "%PYTHONW%" auto_forecast_worker.py
+) else (
+    start "" /B "%PYTHON%" auto_forecast_worker.py
+)
+
+powershell -NoProfile -Command "try { $r = Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:8501/_stcore/health' -TimeoutSec 1; if ($r.StatusCode -eq 200) { exit 0 } } catch {}; exit 1" >nul 2>&1
+if not errorlevel 1 (
+    start "" "http://127.0.0.1:8501"
+    exit /b 0
 )
 
 echo [INFO] Starting local dashboard...
