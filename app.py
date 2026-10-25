@@ -7,6 +7,18 @@ import streamlit as st
 from quant_mm.ui_labels import translate_dataframe, translate_text
 
 
+# The entrypoint owns global page configuration. The underlying pages were also
+# runnable as standalone Streamlit scripts historically, so they still call
+# set_page_config; make those later calls harmless when running through app.py.
+st.set_page_config(
+    page_title="Crypto量化研究平台",
+    page_icon="📈",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+_original_set_page_config = st.set_page_config
+st.set_page_config = lambda *args, **kwargs: None
+
 # Keep the translation layer presentation-only. Stored data and model APIs keep
 # their original stable identifiers.
 _original_dataframe = st.dataframe
