@@ -14,6 +14,7 @@ git pull
   -> desktop shortcut: Crypto量化研究平台
   -> double-click
   -> hidden local launcher
+  -> background auto-forecast worker starts/reuses singleton
   -> browser opens http://127.0.0.1:8501
   -> Chinese navigation and research UI
 ```
@@ -26,10 +27,25 @@ The default page is the fast next-candle direction view. Daily use should answer
 - `pages/00_Quick_Direction.py` — default fast next-candle direction page.
 - `dashboard.py` — detailed multi-horizon forecast research page.
 - `pages/01_Institutional_Alpha.py` — institutional Alpha research page.
-- `start_dashboard.bat` — canonical Windows launcher.
+- `start_dashboard.bat` — canonical Windows launcher and worker bootstrap.
+- `auto_forecast_worker.py` — singleton background automatic-forecast process.
 - `launch_dashboard_hidden.vbs` — hides the console when launched from the desktop shortcut.
 - `create_desktop_shortcut.ps1` — creates `Crypto量化研究平台.lnk` on the current user's Desktop.
 - `创建桌面快捷方式.bat` — one-click wrapper for the PowerShell shortcut installer.
+
+## Quick-page information hierarchy
+
+The quick page should not look like a research notebook. It should use a product-style hierarchy:
+
+1. Large direction banner: `收涨（多） ↑` / `收跌（空） ↓`.
+2. Primary cards: direction probability, expected return %, absolute quote-asset move, predicted close.
+3. Secondary cards: previous close/model base, live reference price, model confidence, direction strength.
+4. Always-visible model/data references: validation direction accuracy, model agreement, MAE, training samples and cache state.
+5. Recent persisted prediction records on the same page.
+
+Avoid packing many `st.metric()` widgets into narrow columns when values are likely to truncate. Prefer responsive HTML/CSS cards with readable wrapping and sensible price precision.
+
+Deep model internals may remain on the detailed research page. The quick page should not force the user to open several expanders just to understand the current prediction.
 
 ## Quick direction semantics
 
@@ -44,17 +60,58 @@ The fast page must keep these meanings stable:
 - If regression direction and the separate up/down probability model disagree, surface the disagreement instead of hiding it.
 - A displayed direction is research output, not an order instruction.
 
+## Prediction-record UX
+
+The quick page must display recent records for the selected exchange/symbol/timeframe.
+
+Duplicate semantics are strict:
+
+```text
+exchange + symbol + timeframe + base candle
+```
+
+may have only one official forecast. Repeated manual clicks must show the first stored forecast rather than recomputing a different value. The same rule applies to the automatic worker.
+
+The history table should prioritize human-facing fields:
+
+- target close time;
+- status;
+- predicted direction;
+- predicted return %;
+- predicted close;
+- actual return %;
+- actual close;
+- direction hit/miss.
+
+## Automatic forecast UX
+
+The quick-page sidebar exposes persistent settings:
+
+- enable/disable automatic forecasting;
+- exchange;
+- one or more symbols;
+- one or more timeframes;
+- polling interval;
+- history window/cache preference inherited from the quick page.
+
+Saving the setting writes `results/forecast/auto_forecast.json`. The desktop launcher starts the singleton worker, which rereads that file. The worker may check frequently, but it creates a new forecast only when the latest fully closed base candle changes.
+
+The UI should make this explicit so users do not confuse “check every minute” with “predict a one-minute horizon”.
+
+See `docs/AUTO_FORECAST.md` for worker semantics.
+
 ## Launcher behavior
 
 `start_dashboard.bat` should:
 
 1. Work from the repository directory regardless of the caller's current directory.
-2. Detect a healthy dashboard already listening on `127.0.0.1:8501`; if found, open it instead of starting another server.
-3. Create `.venv` automatically if it does not exist.
-4. Prefer Python 3.11 through the Windows `py` launcher when available, otherwise fall back to the default Python.
-5. Install `requirements.txt` only when core imports are unavailable.
-6. Run `streamlit run app.py` on local port 8501.
-7. Never require Gate API credentials for research pages.
+2. Create `.venv` automatically if it does not exist.
+3. Prefer Python 3.11 through the Windows `py` launcher when available, otherwise fall back to the default Python.
+4. Install `requirements.txt` only when core imports are unavailable.
+5. Start `auto_forecast_worker.py` through `pythonw.exe` when available. The worker itself enforces singleton behavior.
+6. Detect a healthy dashboard already listening on `127.0.0.1:8501`; if found, open it instead of starting another server.
+7. Otherwise run `streamlit run app.py` on local port 8501.
+8. Never require Gate API credentials for research pages.
 
 ### Windows PowerShell 5.1 encoding rule
 
@@ -122,20 +179,20 @@ Do not return to filename-derived labels such as `dashboard` or `Institutional A
 
 ## Testing
 
-`tests/test_ui_labels.py` protects:
-
-- Chinese status/candle-basis/table-column translation.
-- missing-value rendering policy.
-- model/cache label translation.
-- launcher wiring to `app.py` and the desktop shortcut chain.
-- ASCII-only PowerShell shortcut source for Windows PowerShell 5.1 compatibility.
+`tests/test_ui_labels.py` protects Chinese presentation and launcher wiring.
 
 `tests/test_direction_view.py` protects:
 
-- up/down display semantics from predicted return sign.
-- direction-specific probability display.
-- quote-asset absolute price-change calculation.
+- up/down display semantics from predicted return sign;
+- direction-specific probability display;
+- quote-asset absolute price-change calculation;
 - model-disagreement warnings.
+
+`tests/test_auto_forecast.py` protects:
+
+- saved settings normalization;
+- duplicate target precheck before model training;
+- generation of a new target when no record exists.
 
 Always run:
 
