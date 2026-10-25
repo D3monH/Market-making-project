@@ -16,7 +16,6 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
-_original_set_page_config = st.set_page_config
 st.set_page_config = lambda *args, **kwargs: None
 
 # Keep the translation layer presentation-only. Stored data and model APIs keep
@@ -30,7 +29,11 @@ _original_bar_chart = st.bar_chart
 
 
 def _dataframe(data=None, *args, **kwargs):
-    return _original_dataframe(translate_dataframe(data), *args, **kwargs)
+    return _original_dataframe(
+        translate_dataframe(data, fill_missing=True),
+        *args,
+        **kwargs,
+    )
 
 
 def _title(body, *args, **kwargs):
