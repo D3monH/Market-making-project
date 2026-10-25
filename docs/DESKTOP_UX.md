@@ -40,6 +40,12 @@ git pull
 6. Run `streamlit run app.py` on local port 8501.
 7. Never require Gate API credentials for research pages.
 
+### Windows PowerShell 5.1 encoding rule
+
+`create_desktop_shortcut.ps1` must remain ASCII-only source code. Windows PowerShell 5.1 may interpret UTF-8 files without BOM using the legacy system code page; non-ASCII literals can become mojibake and can even break parsing. The Chinese shortcut name is therefore constructed at runtime from Unicode code points.
+
+Do not add Chinese literals directly back into `create_desktop_shortcut.ps1`. Human-facing Chinese belongs in the Python/Streamlit presentation layer or can be generated at runtime when a legacy Windows script must stay encoding-safe.
+
 ## Chinese UI policy
 
 Human-facing text is Chinese by default. Keep common industry names where translating them would reduce recognition, for example:
@@ -105,6 +111,7 @@ Do not return to filename-derived labels such as `dashboard` or `Institutional A
 - missing-value rendering policy.
 - model/cache label translation.
 - launcher wiring to `app.py` and the desktop shortcut chain.
+- ASCII-only PowerShell shortcut source for Windows PowerShell 5.1 compatibility.
 
 Always run:
 
