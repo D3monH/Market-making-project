@@ -11,10 +11,13 @@ from quant_mm.auto_forecast import (
     run_auto_forecast_cycle,
     save_auto_status,
 )
+from quant_mm.event_contract_store import pending_due_index_events, settle_due_index_events
+from quant_mm.gate_event_data import fetch_gate_index_candle
 
 CONFIG_PATH = Path("config_forecast.yaml")
 SINGLETON_HOST = "127.0.0.1"
 SINGLETON_PORT = 8766
+EVENT_RESULTS_DIR = Path("results/event_contracts")
 
 
 def load_project_config() -> dict:
@@ -35,15 +38,35 @@ def acquire_singleton() -> socket.socket | None:
         return None
 
 
+def _settle_matured_event_contracts() -> None:
+    """Settle due INDEX event predictions without polling Gate when none are due."""
+    try:
+        if pending_due_index_events(EVENT_RESULTS_DIR, limit=1):
+            settle_due_index_events(
+                EVENT_RESULTS_DIR,
+                fetch_gate_index_candle,
+                limit=100,
+            )
+    except Exception:
+        # Event research must never kill the long-running forecast worker.
+        pass
+
+
 def main() -> int:
     singleton = acquire_singleton()
     if singleton is None:
         return 0
 
     next_run = 0.0
+    next_event_settle = 0.0
     was_enabled = False
     try:
         while True:
+            now = time.monotonic()
+            if now >= next_event_settle:
+                _settle_matured_event_contracts()
+                next_event_settle = time.monotonic() + 60.0
+
             config = load_project_config()
             results_dir = str(config.get("results_dir", "results/forecast"))
             settings = load_auto_settings(results_dir)
