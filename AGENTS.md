@@ -46,6 +46,18 @@ This repository is an experimental crypto quantitative-research platform. Read `
 - Manual preferences must never rewrite historical predictions or realized score history.
 - If adding a new estimator, verify that its training path supports sample weights or explicitly documents why it does not.
 
+## UI / desktop experience constraints
+
+- `app.py` is the preferred human-facing Streamlit entrypoint. It provides Chinese navigation and presentation translation while preserving stable internal identifiers.
+- `dashboard.py` and `pages/01_Institutional_Alpha.py` remain the research pages; do not duplicate model/data logic into `app.py`.
+- User-facing labels should be Chinese by default. Keep established domain names such as BTC/ETH, Alpha, Funding, OI, Basis, Linear/Ridge/ExtraTrees when useful for recognition.
+- Do not rename persisted database fields/enums merely to make the UI Chinese. Translate at the presentation layer via `quant_mm/ui_labels.py`.
+- Human-facing tables should not expose raw values such as `PENDING`, `SETTLED`, `gate_native_utc_day`, `legacy_alpha_unversioned`, `timeframe`, or `actual_return_pct` when a Chinese label exists.
+- Missing display values should render as `—`, not Python `None`.
+- `start_dashboard.bat` is the canonical one-click launcher. It may initialize `.venv`, install dependencies when needed, and should reuse an already-running local dashboard on port 8501.
+- `launch_dashboard_hidden.vbs` + `create_desktop_shortcut.ps1` implement the Windows desktop shortcut flow. Keep the shortcut target stable so repository updates do not require recreating it.
+- See `docs/DESKTOP_UX.md` before changing launcher/navigation behavior.
+
 ## UI error-handling constraints
 
 - Streamlit research pages should not expose a full traceback for routine market-data timeouts.
@@ -54,14 +66,18 @@ This repository is an experimental crypto quantitative-research platform. Read `
 
 ## Current major components
 
+- `app.py`: preferred Chinese multi-page Streamlit entrypoint.
+- `start_dashboard.bat`: Windows one-click local launcher.
+- `launch_dashboard_hidden.vbs` / `create_desktop_shortcut.ps1`: desktop shortcut and hidden launcher.
 - `main.py` / `quant_mm/backtest.py`: historical V0.1-style market-making backtest.
 - `gate_paper.py`: Gate public realtime paper market making; no real orders.
 - `forecast.py`: multi-horizon forecast CLI.
-- `dashboard.py`: main Streamlit forecast dashboard.
+- `dashboard.py`: main Streamlit forecast research page.
 - `pages/01_Institutional_Alpha.py`: institutional-style alpha research page.
 - `forecast_monitor.py`: long-running forecast maturity/verification monitor.
 - `quant_mm/data.py`: exchange-native market-data transport, time semantics, retry/history guards.
 - `quant_mm/market_cache.py`: persistent incremental OHLCV cache and data-quality metadata.
+- `quant_mm/ui_labels.py`: presentation-only Chinese label/value translation.
 - `quant_mm/forecast_engine.py`: next-candle ensemble forecast model, recency sample weights and bounded manual model multipliers.
 - `quant_mm/forecast_store.py`: persistent forecast SQLite + maturity verification.
 - `quant_mm/model_performance.py`: model-level realized leaderboard and dynamic weights.
@@ -75,7 +91,7 @@ This repository is an experimental crypto quantitative-research platform. Read `
 python -m pytest -q
 ```
 
-When touching forecast time/data/model semantics, specifically review:
+When touching forecast time/data/model/UI semantics, specifically review:
 
 - `tests/test_data_recency.py`
 - `tests/test_forecast_time_alignment.py`
@@ -87,12 +103,13 @@ When touching forecast time/data/model semantics, specifically review:
 - `tests/test_forecast.py`
 - `tests/test_institutional_alpha.py`
 - `tests/test_model_performance.py`
+- `tests/test_ui_labels.py`
 
 ## Documentation discipline
 
 For meaningful architecture/data-semantics changes:
 
-1. Update `docs/DEVELOPMENT_STATUS.md`.
+1. Update `docs/DEVELOPMENT_STATUS.md` or a focused handoff doc.
 2. Update the relevant detailed doc under `docs/`.
 3. Add a concise entry to `CHANGELOG.md`.
 4. Add/adjust tests that encode the new invariant.
@@ -101,7 +118,7 @@ For meaningful architecture/data-semantics changes:
 
 Priority order:
 
-1. Stabilize data quality, time alignment, local cache, persistence and verification.
+1. Stabilize data quality, time alignment, local cache, persistence, verification and operator UX.
 2. Historical Funding/OI/Basis/Liquidation/Taker-flow datasets aligned to forecast candles.
 3. Cross-asset BTC/ETH/SOL features and market breadth.
 4. Alpha realized-performance weighting and correlation-aware portfolio of alphas.
