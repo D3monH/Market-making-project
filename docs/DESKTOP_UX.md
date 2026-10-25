@@ -18,15 +18,31 @@ git pull
   -> Chinese navigation and research UI
 ```
 
+The default page is the fast next-candle direction view. Daily use should answer the operator's core question first: will the next candle likely close up or down relative to the previous fully closed candle, and by roughly how much?
+
 ## Entry points
 
 - `app.py` — preferred human-facing Streamlit entrypoint.
-- `dashboard.py` — multi-horizon forecast research page.
+- `pages/00_Quick_Direction.py` — default fast next-candle direction page.
+- `dashboard.py` — detailed multi-horizon forecast research page.
 - `pages/01_Institutional_Alpha.py` — institutional Alpha research page.
 - `start_dashboard.bat` — canonical Windows launcher.
 - `launch_dashboard_hidden.vbs` — hides the console when launched from the desktop shortcut.
 - `create_desktop_shortcut.ps1` — creates `Crypto量化研究平台.lnk` on the current user's Desktop.
 - `创建桌面快捷方式.bat` — one-click wrapper for the PowerShell shortcut installer.
+
+## Quick direction semantics
+
+The fast page must keep these meanings stable:
+
+- `收涨（多） ↑`: predicted next close is above the previous fully closed candle close.
+- `收跌（空） ↓`: predicted next close is below the previous fully closed candle close.
+- The model base is always the previous fully closed candle close, never the live ticker.
+- The primary return display is percentage return: `(predicted close - base close) / base close`.
+- Absolute price change is secondary and is shown in the quote asset, e.g. `+182.5 USDT` for BTC/USDT. Do not present this as a universal "points return" because absolute price units are not comparable across BTC/ETH/SOL.
+- Direction probability should correspond to the displayed direction: use `P(up)` for an up forecast and `1-P(up)` for a down forecast.
+- If regression direction and the separate up/down probability model disagree, surface the disagreement instead of hiding it.
+- A displayed direction is research output, not an order instruction.
 
 ## Launcher behavior
 
@@ -98,8 +114,9 @@ rename database schema/enums to Chinese
 
 `app.py` uses `st.navigation` with explicit human-facing page names:
 
-- `多周期预测`
-- `机构 Alpha 研究`
+- `快速多空预测` — default daily-use page.
+- `详细预测研究` — models, history, validation and charts.
+- `机构 Alpha 研究` — derivatives/factor research.
 
 Do not return to filename-derived labels such as `dashboard` or `Institutional Alpha` in the preferred launcher flow.
 
@@ -112,6 +129,13 @@ Do not return to filename-derived labels such as `dashboard` or `Institutional A
 - model/cache label translation.
 - launcher wiring to `app.py` and the desktop shortcut chain.
 - ASCII-only PowerShell shortcut source for Windows PowerShell 5.1 compatibility.
+
+`tests/test_direction_view.py` protects:
+
+- up/down display semantics from predicted return sign.
+- direction-specific probability display.
+- quote-asset absolute price-change calculation.
+- model-disagreement warnings.
 
 Always run:
 
