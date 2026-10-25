@@ -20,10 +20,23 @@ This repository is an experimental crypto quantitative-research platform. Read `
    - target candle: 20:15 -> 20:30
    - target to verify: 20:30 close
 4. One exchange + symbol + timeframe + base candle may create only one persistent forecast. Re-clicking must not rewrite/cherry-pick the prediction.
-5. New Gate 1d forecasts use Gate's exchange-native daily candle. Its boundary is UTC 00:00 -> next UTC 00:00, which displays as Beijing 08:00 -> next-day 08:00 in `Asia/Shanghai`. Do not rebuild new Gate daily forecasts as Beijing 00:00 -> 24:00.
-6. Legacy records with `natural_day:Asia/Shanghai` are historical compatibility cohorts only. They may still be settled using the legacy 4h aggregation path, but must never be mixed with the new Gate-native daily cohort.
-7. Verification happens only after the complete target candle has closed.
-8. Realized model/alpha scores must come only from settled out-of-sample predictions.
+5. Manual and automatic forecast paths must show/use the same first persisted prediction for a target. If a record already exists for the current base candle, do not retrain just to display another result.
+6. New Gate 1d forecasts use Gate's exchange-native daily candle. Its boundary is UTC 00:00 -> next UTC 00:00, which displays as Beijing 08:00 -> next-day 08:00 in `Asia/Shanghai`. Do not rebuild new Gate daily forecasts as Beijing 00:00 -> 24:00.
+7. Legacy records with `natural_day:Asia/Shanghai` are historical compatibility cohorts only. They may still be settled using the legacy 4h aggregation path, but must never be mixed with the new Gate-native daily cohort.
+8. Verification happens only after the complete target candle has closed.
+9. Realized model/alpha scores must come only from settled out-of-sample predictions.
+
+## Automatic forecast invariants
+
+- `quant_mm/auto_forecast.py` owns saved auto-forecast settings and a single forecast cycle.
+- `auto_forecast_worker.py` is the persistent background worker started by the Windows launcher.
+- Poll frequency is only the frequency used to check for a newly closed candle; it is not a forecast horizon.
+- Every cycle must check the current base candle against persisted history before model training. Existing targets are skipped without retraining.
+- SQLite's existing unique key remains the final duplicate guard; do not weaken it.
+- Auto forecasts and manual forecasts share the same `forecast_history.sqlite3` truth set. Do not create a second history database for automatic forecasts.
+- Auto forecast settings live under `results/forecast/auto_forecast.json`; worker status is operational metadata in `auto_forecast_status.json`.
+- Auto forecasting is research automation only. It must not submit exchange orders or require private API credentials.
+- Read `docs/AUTO_FORECAST.md` before changing worker/scheduling behavior.
 
 ## Market-data constraints
 
@@ -49,7 +62,7 @@ This repository is an experimental crypto quantitative-research platform. Read `
 ## UI / desktop experience constraints
 
 - `app.py` is the preferred human-facing Streamlit entrypoint. It provides Chinese navigation and presentation translation while preserving stable internal identifiers.
-- `pages/00_Quick_Direction.py` is the default daily-use page. It should answer the next-candle direction question first and keep research detail secondary.
+- `pages/00_Quick_Direction.py` is the default daily-use page. It should answer the next-candle direction question first and keep model/data references visible without forcing the user through multiple expanders.
 - `dashboard.py` and `pages/01_Institutional_Alpha.py` remain detailed research pages; do not duplicate model/data semantics in presentation code.
 - Quick direction semantics are fixed:
   - predicted close above the previous fully closed candle close => `收涨（多） ↑`;
@@ -58,11 +71,12 @@ This repository is an experimental crypto quantitative-research platform. Read `
   - absolute price move is secondary and shown in the quote asset (for example USDT), not as a universal comparable points-return metric;
   - use `P(up)` for an up forecast and `1-P(up)` for a down forecast;
   - surface disagreement between regression direction and the separate probability classifier instead of hiding it.
+- The quick page must show recent persisted prediction history and make duplicate semantics clear to the user.
 - User-facing labels should be Chinese by default. Keep established domain names such as BTC/ETH, Alpha, Funding, OI, Basis, Linear/Ridge/ExtraTrees when useful for recognition.
 - Do not rename persisted database fields/enums merely to make the UI Chinese. Translate at the presentation layer via `quant_mm/ui_labels.py`.
 - Human-facing tables should not expose raw values such as `PENDING`, `SETTLED`, `gate_native_utc_day`, `legacy_alpha_unversioned`, `timeframe`, or `actual_return_pct` when a Chinese label exists.
 - Missing display values should render as `—`, not Python `None`.
-- `start_dashboard.bat` is the canonical one-click launcher. It may initialize `.venv`, install dependencies when needed, and should reuse an already-running local dashboard on port 8501.
+- `start_dashboard.bat` is the canonical one-click launcher. It initializes/reuses the environment, starts the singleton automatic forecast worker, then opens/reuses the dashboard on port 8501.
 - `launch_dashboard_hidden.vbs` + `create_desktop_shortcut.ps1` implement the Windows desktop shortcut flow. Keep the shortcut target stable so repository updates do not require recreating it.
 - See `docs/DESKTOP_UX.md` before changing launcher/navigation behavior.
 
@@ -75,8 +89,10 @@ This repository is an experimental crypto quantitative-research platform. Read `
 ## Current major components
 
 - `app.py`: preferred Chinese multi-page Streamlit entrypoint.
-- `pages/00_Quick_Direction.py`: default fast next-candle long/short direction view.
-- `start_dashboard.bat`: Windows one-click local launcher.
+- `pages/00_Quick_Direction.py`: default fast next-candle direction view, prediction history and auto-forecast controls.
+- `start_dashboard.bat`: Windows one-click local launcher; also starts the singleton background worker.
+- `auto_forecast_worker.py`: background scheduler/checker for persistent automatic forecasts.
+- `quant_mm/auto_forecast.py`: auto settings/status, duplicate precheck and automatic forecast cycle.
 - `launch_dashboard_hidden.vbs` / `create_desktop_shortcut.ps1`: desktop shortcut and hidden launcher.
 - `main.py` / `quant_mm/backtest.py`: historical V0.1-style market-making backtest.
 - `gate_paper.py`: Gate public realtime paper market making; no real orders.
@@ -115,6 +131,7 @@ When touching forecast time/data/model/UI semantics, specifically review:
 - `tests/test_model_performance.py`
 - `tests/test_ui_labels.py`
 - `tests/test_direction_view.py`
+- `tests/test_auto_forecast.py`
 
 ## Documentation discipline
 

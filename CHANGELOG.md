@@ -1,5 +1,19 @@
 # Changelog
 
+## 2026-10-25 - Quick direction terminal and persistent auto forecasting
+
+- Reworked `pages/00_Quick_Direction.py` into a wider product-style daily-use terminal with responsive cards instead of narrow `st.metric()` columns that truncate BTC prices and labels.
+- The quick page now keeps direction, direction probability, expected return %, quote-asset price change, predicted close, base close, live reference price, confidence, validation accuracy, model agreement, MAE and training-sample count visible without forcing multiple expanders.
+- Removed an accidental top-level English string from `app.py` that Streamlit magic rendered above the page.
+- Added a recent prediction-history table directly to the quick page.
+- Manual repeated clicks for the same exchange + symbol + timeframe + base candle now load the first persisted forecast instead of recomputing a different display-only result.
+- Added persistent automatic-forecast settings through `quant_mm/auto_forecast.py` and `results/forecast/auto_forecast.json`.
+- Added `auto_forecast_worker.py` as a singleton background checker. Poll frequency only checks for newly closed candles; an unchanged base candle is skipped before model training.
+- Updated `start_dashboard.bat` to start/reuse the background worker whenever the desktop platform is launched.
+- Automatic forecasts share the same SQLite truth set and duplicate invariant as manual forecasts and may also settle due predictions.
+- Added `docs/AUTO_FORECAST.md` and expanded Codex/Desktop UX handoff rules.
+- Added `tests/test_auto_forecast.py` for settings persistence, duplicate precheck and new-target generation.
+
 ## 2026-10-25 - Chinese desktop UX and one-click launcher
 
 - Added `app.py` as the preferred human-facing Streamlit entrypoint with explicit Chinese navigation: `多周期预测` and `机构 Alpha 研究`.

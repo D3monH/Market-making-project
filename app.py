@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Chinese desktop-style entrypoint for the Streamlit research UI."""
+# Chinese desktop-style entrypoint for the Streamlit research UI.
 
 import streamlit as st
 
