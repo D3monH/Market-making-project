@@ -1,5 +1,17 @@
 # Changelog
 
+## 2026-10-25 - Chinese desktop UX and one-click launcher
+
+- Added `app.py` as the preferred human-facing Streamlit entrypoint with explicit Chinese navigation: `多周期预测` and `机构 Alpha 研究`.
+- Added presentation-only Chinese mapping in `quant_mm/ui_labels.py`; stable database/model identifiers remain unchanged.
+- Translated common raw UI values such as `PENDING`, `SETTLED`, `gate_native_utc_day`, `exchange_native_closed`, cache modes and model names into readable Chinese labels.
+- Human-facing tables now render missing values as `—` instead of Python `None`.
+- Updated `start_dashboard.bat` into a self-initializing launcher: creates `.venv` when absent, installs dependencies when needed, starts `app.py`, and reuses an already-running healthy dashboard on `127.0.0.1:8501`.
+- Added `launch_dashboard_hidden.vbs` so desktop launches do not leave a command window visible.
+- Added `create_desktop_shortcut.ps1` plus `创建桌面快捷方式.bat`; one setup creates a persistent desktop shortcut named `Crypto量化研究平台`.
+- Added `docs/DESKTOP_UX.md` and updated `AGENTS.md` so Codex preserves the Chinese presentation layer and one-click Windows workflow.
+- Added `tests/test_ui_labels.py` for label translation, missing-value display and launcher wiring.
+
 ## 2026-10-25 - Persistent OHLCV cache and custom training weights
 
 - Added `quant_mm/market_cache.py` as the normal forecast/Alpha/CLI market-data working layer.
