@@ -47,6 +47,7 @@ def test_one_click_launcher_is_wired_to_chinese_app_entrypoint():
 
     assert "streamlit run app.py" in start
     assert "127.0.0.1:8501" in start
-    assert "Crypto量化研究平台.lnk" in shortcut
     assert "launch_dashboard_hidden.vbs" in shortcut
+    assert "0x91CF" in shortcut and "0x53F0" in shortcut
+    assert all(ord(ch) < 128 for ch in shortcut)
     assert "start_dashboard.bat" in hidden

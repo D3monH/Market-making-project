@@ -1,26 +1,33 @@
 $ErrorActionPreference = "Stop"
 
+function Convert-FromCodePoints {
+    param([int[]]$CodePoints)
+    return -join ($CodePoints | ForEach-Object { [char]$_ })
+}
+
 $repoRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $launcher = Join-Path $repoRoot "launch_dashboard_hidden.vbs"
 
 if (-not (Test-Path $launcher)) {
-    throw "找不到启动器：$launcher"
+    throw "Launcher not found: $launcher"
 }
 
 $desktop = [Environment]::GetFolderPath("Desktop")
-$shortcutPath = Join-Path $desktop "Crypto量化研究平台.lnk"
+# Build the localized shortcut suffix at runtime so this source stays ASCII-only.
+$appName = "Crypto" + (Convert-FromCodePoints @(0x91CF, 0x5316, 0x7814, 0x7A76, 0x5E73, 0x53F0))
+$shortcutPath = Join-Path $desktop ($appName + ".lnk")
 
 $wsh = New-Object -ComObject WScript.Shell
 $shortcut = $wsh.CreateShortcut($shortcutPath)
 $shortcut.TargetPath = "$env:WINDIR\System32\wscript.exe"
 $shortcut.Arguments = '"' + $launcher + '"'
 $shortcut.WorkingDirectory = $repoRoot
-$shortcut.Description = "Crypto 多周期预测与机构 Alpha 研究平台"
+$shortcut.Description = "Crypto quantitative research platform"
 $shortcut.IconLocation = "$env:WINDIR\System32\shell32.dll,167"
 $shortcut.Save()
 
 Write-Host ""
-Write-Host "已创建桌面快捷方式：" -ForegroundColor Green
+Write-Host "Desktop shortcut created:" -ForegroundColor Green
 Write-Host $shortcutPath -ForegroundColor Cyan
 Write-Host ""
-Write-Host "以后双击桌面的『Crypto量化研究平台』即可启动。" -ForegroundColor Green
+Write-Host "Double-click the shortcut to start the platform." -ForegroundColor Green
