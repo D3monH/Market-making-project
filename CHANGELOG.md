@@ -1,5 +1,21 @@
 # Changelog
 
+## 2026-10-25 - Gate event contracts probability research center
+
+- Added `Gate 事件合约` as a dedicated desktop page for crypto event-contract research.
+- Added current Gate crypto-event scope: BTC/ETH/SOL/XRP/DOGE/HYPE/BNB and 5m/15m/1h/4h research selection.
+- Added official Gate INDEX data support for the currently documented BTC/ETH 5m/15m INDEX event markets through `index_*` futures index candlesticks.
+- INDEX OHLC comes from the Gate index; ordinary futures volume is aligned only as a model activity feature.
+- Added explicit TWAP research mode. Gate documentation says event TWAP is Chainlink 60-second TWAP; because public API v4 does not document event TWAP history/order books, spot/history proxies are never labeled as official TWAP settlement data.
+- Added event probability fusion: logistic P(UP) + regression-implied probability + bounded Institutional Alpha log-odds adjustment + volatility risk shrink.
+- Institutional Alpha can use Momentum/Trend/Mean Reversion and public Gate Funding/OI/Basis/positioning/microstructure context to calibrate event probabilities without overwriting the price model.
+- Added optional manual Gate UP/DOWN prices and gross Edge/EV/ROI calculations before dynamic trading fees.
+- Added independent `results/event_contracts/event_contract_history.sqlite3` persistence with one record per asset + timeframe + benchmark + event open.
+- Added automatic INDEX maturity verification from the exact Gate index event candle open/close, including direction accuracy, Brier score, log loss and optional realized PnL/share.
+- Added manual TWAP settlement workflow until an official documented Gate event TWAP history API is available.
+- Extended the existing background worker to settle matured INDEX event predictions without submitting orders.
+- Added `docs/GATE_EVENT_CONTRACTS.md` and event-specific tests.
+
 ## 2026-10-25 - Quick direction terminal and persistent auto forecasting
 
 - Reworked `pages/00_Quick_Direction.py` into a wider product-style daily-use terminal with responsive cards instead of narrow `st.metric()` columns that truncate BTC prices and labels.
