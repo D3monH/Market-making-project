@@ -13,8 +13,7 @@ if (-not (Test-Path $launcher)) {
 }
 
 $desktop = [Environment]::GetFolderPath("Desktop")
-# Build the Chinese suffix at runtime so this source file stays ASCII-only.
-# Unicode code points: 量 化 研 究 平 台
+# Build the localized shortcut suffix at runtime so this source stays ASCII-only.
 $appName = "Crypto" + (Convert-FromCodePoints @(0x91CF, 0x5316, 0x7814, 0x7A76, 0x5E73, 0x53F0))
 $shortcutPath = Join-Path $desktop ($appName + ".lnk")
 
