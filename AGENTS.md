@@ -38,10 +38,26 @@ This repository is an experimental crypto quantitative-research platform. Read `
 - Auto forecasting is research automation only. It must not submit exchange orders or require private API credentials.
 - Read `docs/AUTO_FORECAST.md` before changing worker/scheduling behavior.
 
+## Gate event-contract invariants
+
+- Read `docs/GATE_EVENT_CONTRACTS.md` before changing event-contract data or settlement behavior.
+- Event-contract persistence is independent from ordinary K-line forecast history: `results/event_contracts/event_contract_history.sqlite3`.
+- Event uniqueness is `exchange + asset + timeframe + benchmark + event_open_at`. Never rewrite the first official prediction for the same event.
+- Current supported crypto-event assets are BTC, ETH, SOL, XRP, DOGE, HYPE and BNB; cycles are 5m, 15m, 1h and 4h.
+- Gate INDEX event markets currently use Gate futures index prices. The documented rollout currently covers BTC/ETH 5m and 15m. INDEX OHLC must come from `index_*` Gate futures candlesticks, not spot or last-trade prices.
+- Gate INDEX index candles do not contain traded volume; ordinary futures volume may be timestamp-aligned only as an auxiliary feature. It must never replace INDEX OHLC prices.
+- INDEX settlement verification uses the exact event index candle: `close >= open => UP`, otherwise DOWN.
+- Gate TWAP event markets use Chainlink-provided 60-second TWAP according to Gate product documentation. Do not label Gate spot/index proxies as official TWAP settlement data.
+- Until Gate exposes a documented public event TWAP history/order-book API, TWAP predictions are `RESEARCH_ONLY` and require manual final-result verification.
+- Institutional Alpha is a bounded probability-calibration layer for event contracts. Funding/OI/Basis/positioning/microstructure may shift log-odds within a cap; they must not silently overwrite the next-close price model.
+- Event evaluation must include probability-quality metrics (Brier score/log loss), not direction accuracy alone.
+- Manually entered UP/DOWN event prices are research inputs. Edge/EV/ROI shown from them are gross before Gate dynamic trading fees and execution slippage.
+- The current event module must not submit orders through undocumented/private endpoints. Add execution only after Gate exposes a documented supported event-contract integration path.
+
 ## Market-data constraints
 
 - All forecast market-data access should flow through `quant_mm/data.py` and, for normal forecast/Alpha UI/CLI usage, through `quant_mm/market_cache.py`.
-- Persistent OHLCV cache files live under `data/cache/ohlcv/<exchange>/<symbol>/<timeframe>.csv` by default. First use downloads a requested window; later runs refresh only a small recent overlap, merge, deduplicate and retain the full local history. Do not truncate the cache to the current training-window size.
+- Persistent OHLCV cache files live under `data/cache/ohlcv/<exchange>/<symbol>/<timeframe>.csv` by default. First use downloads a requested window; later runs refresh only a small recent overlap, merge/deduplicate and retain the full local history. Do not truncate the cache to the current training-window size.
 - A cache may be used during a temporary exchange outage only if the latest cached closed candle still passes the normal recency check. Stale cache must never produce a formal forecast.
 - Cache metadata (`cache_refresh_mode`, total rows, downloaded rows, missing intervals, cache path) should remain observable in the research UI.
 - Gate spot candlesticks reject excessively old `since/from` windows. The data layer contains a venue-aware history cap and safety margin. Do not bypass it by calling CCXT OHLCV directly from Streamlit pages.
@@ -63,6 +79,7 @@ This repository is an experimental crypto quantitative-research platform. Read `
 
 - `app.py` is the preferred human-facing Streamlit entrypoint. It provides Chinese navigation and presentation translation while preserving stable internal identifiers.
 - `pages/00_Quick_Direction.py` is the default daily-use page. It should answer the next-candle direction question first and keep model/data references visible without forcing the user through multiple expanders.
+- `pages/02_Gate_Event_Contracts.py` is the event-contract probability/Edge research page.
 - `dashboard.py` and `pages/01_Institutional_Alpha.py` remain detailed research pages; do not duplicate model/data semantics in presentation code.
 - Quick direction semantics are fixed:
   - predicted close above the previous fully closed candle close => `收涨（多） ↑`;
@@ -83,15 +100,16 @@ This repository is an experimental crypto quantitative-research platform. Read `
 ## UI error-handling constraints
 
 - Streamlit research pages should not expose a full traceback for routine market-data timeouts.
-- A failed network request must not persist a new formal forecast/alpha record.
-- Existing SQLite forecast/alpha history should remain readable even when current public APIs are temporarily unavailable.
+- A failed network request must not persist a new formal forecast/alpha/event record.
+- Existing SQLite forecast/alpha/event history should remain readable even when current public APIs are temporarily unavailable.
 
 ## Current major components
 
 - `app.py`: preferred Chinese multi-page Streamlit entrypoint.
 - `pages/00_Quick_Direction.py`: default fast next-candle direction view, prediction history and auto-forecast controls.
+- `pages/02_Gate_Event_Contracts.py`: Gate crypto event-contract probability/Edge research center.
 - `start_dashboard.bat`: Windows one-click local launcher; also starts the singleton background worker.
-- `auto_forecast_worker.py`: background scheduler/checker for persistent automatic forecasts.
+- `auto_forecast_worker.py`: background scheduler/checker for persistent automatic forecasts and matured INDEX-event settlement.
 - `quant_mm/auto_forecast.py`: auto settings/status, duplicate precheck and automatic forecast cycle.
 - `launch_dashboard_hidden.vbs` / `create_desktop_shortcut.ps1`: desktop shortcut and hidden launcher.
 - `main.py` / `quant_mm/backtest.py`: historical V0.1-style market-making backtest.
@@ -102,6 +120,9 @@ This repository is an experimental crypto quantitative-research platform. Read `
 - `forecast_monitor.py`: long-running forecast maturity/verification monitor.
 - `quant_mm/data.py`: exchange-native market-data transport, time semantics, retry/history guards.
 - `quant_mm/market_cache.py`: persistent incremental OHLCV cache and data-quality metadata.
+- `quant_mm/gate_event_data.py`: Gate INDEX event-market public data and cache semantics.
+- `quant_mm/event_contract_engine.py`: event probability fusion and market Edge/EV calculations.
+- `quant_mm/event_contract_store.py`: independent event persistence, INDEX auto-settlement and TWAP manual settlement.
 - `quant_mm/ui_labels.py`: presentation-only Chinese label/value translation.
 - `quant_mm/direction_view.py`: pure next-candle direction/percentage/absolute-move presentation semantics.
 - `quant_mm/forecast_engine.py`: next-candle ensemble forecast model, recency sample weights and bounded manual model multipliers.
@@ -132,6 +153,9 @@ When touching forecast time/data/model/UI semantics, specifically review:
 - `tests/test_ui_labels.py`
 - `tests/test_direction_view.py`
 - `tests/test_auto_forecast.py`
+- `tests/test_event_contract_engine.py`
+- `tests/test_event_contract_store.py`
+- `tests/test_gate_event_data.py`
 
 ## Documentation discipline
 
@@ -147,10 +171,11 @@ For meaningful architecture/data-semantics changes:
 Priority order:
 
 1. Stabilize data quality, time alignment, local cache, persistence, verification and operator UX.
-2. Historical Funding/OI/Basis/Liquidation/Taker-flow datasets aligned to forecast candles.
-3. Cross-asset BTC/ETH/SOL features and market breadth.
-4. Alpha realized-performance weighting and correlation-aware portfolio of alphas.
-5. HMM/regime models, LightGBM/XGBoost/quantile models after data quality is proven.
-6. Gate TestNet order lifecycle/reconciliation only after research metrics are stable.
+2. Accumulate event-contract INDEX probability calibration history and official realized Brier/log-loss metrics.
+3. Historical Funding/OI/Basis/Liquidation/Taker-flow datasets aligned to forecast/event candles.
+4. Cross-asset BTC/ETH/SOL features and market breadth.
+5. Alpha realized-performance weighting and correlation-aware portfolio of alphas.
+6. HMM/regime models, LightGBM/XGBoost/quantile models after data quality is proven.
+7. Gate TestNet/order execution only through documented supported APIs and only after research metrics are stable.
 
 Do not jump directly to Transformer/deep-learning or live capital deployment before the above data/verification layers are mature.
