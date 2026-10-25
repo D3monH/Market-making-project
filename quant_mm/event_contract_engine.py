@@ -15,6 +15,7 @@ class EventProbabilityResult:
     raw_classifier_up_probability: float
     regression_implied_up_probability: float
     model_up_probability: float
+    event_expected_return_pct: float
     alpha_adjustment_logit: float
     final_up_probability: float
     final_down_probability: float
@@ -65,21 +66,28 @@ def build_event_probability(
     forecast: ForecastResult,
     alpha: AlphaResult | None = None,
     *,
+    event_reference_price: float | None = None,
     classifier_weight: float = 0.70,
     max_alpha_logit_shift: float = 0.80,
 ) -> EventProbabilityResult:
     """Convert next-close forecast output into an event-contract probability.
 
-    The event probability deliberately keeps model and institutional Alpha as
-    separate evidence layers. Regression direction is converted into a bounded
-    probability using recent volatility, then blended with the independent
-    logistic classifier. Alpha can move the log-odds only within a strict cap,
-    and high-volatility risk shrinks the final probability back toward 50%.
+    The regression leg is measured against the event's actual/reference start
+    price when that price is available. This matters for INDEX markets because
+    the event candle open can differ slightly from the previous candle close.
+    Alpha remains an independent bounded log-odds adjustment; high-volatility
+    risk shrinks the final probability back toward 50% instead of increasing
+    conviction.
     """
     classifier_p = _clip_probability(forecast.up_probability)
+    reference = float(event_reference_price or forecast.current_price)
+    if reference <= 0.0:
+        reference = float(forecast.current_price)
+    event_return_pct = (float(forecast.expected_price) / reference - 1.0) * 100.0
+
     vol_pct = max(abs(float(forecast.realized_volatility_pct)), 0.05)
     regression_scale = max(vol_pct * 0.85, 0.05)
-    regression_p = _sigmoid(float(forecast.expected_return_pct) / regression_scale)
+    regression_p = _sigmoid(event_return_pct / regression_scale)
 
     cw = float(np.clip(classifier_weight, 0.50, 0.90))
     model_p = _clip_probability(cw * classifier_p + (1.0 - cw) * regression_p)
@@ -137,6 +145,7 @@ def build_event_probability(
         raw_classifier_up_probability=classifier_p,
         regression_implied_up_probability=regression_p,
         model_up_probability=model_p,
+        event_expected_return_pct=event_return_pct,
         alpha_adjustment_logit=alpha_shift,
         final_up_probability=final_p,
         final_down_probability=1.0 - final_p,
