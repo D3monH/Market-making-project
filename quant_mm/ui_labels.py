@@ -95,7 +95,7 @@ def translate_text(value):
     return out
 
 
-def translate_dataframe(data):
+def translate_dataframe(data, *, fill_missing: bool = False):
     if not isinstance(data, pd.DataFrame):
         return data
     out = data.copy()
@@ -103,4 +103,6 @@ def translate_dataframe(data):
     for column in out.columns:
         if out[column].dtype == object or pd.api.types.is_string_dtype(out[column]):
             out[column] = out[column].map(translate_scalar)
+    if fill_missing:
+        out = out.astype(object).where(pd.notna(out), "—")
     return out
